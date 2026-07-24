@@ -9,6 +9,8 @@ import asyncio
 import signal
 import subprocess
 import shutil
+import urllib.parse
+import urllib.request
 import discord
 from discord.ext import commands
 from openai import AsyncOpenAI, APIStatusError
@@ -118,10 +120,12 @@ def get_bullpen_binary_path() -> str:
 
     return "bullpen"
 
-def run_bullpen_positions(address: str = None, source: str = None) -> str:
+def run_bullpen_positions(address: str = None, source: str = None, json_mode: bool = False) -> str:
     """Executes the `bullpen polymarket positions` CLI command via subprocess."""
     bin_path = get_bullpen_binary_path()
     cmd_parts = [bin_path, "polymarket", "positions"]
+    if json_mode:
+        cmd_parts.append("--json")
     if address:
         cmd_parts.extend(["--address", address])
     if source:
@@ -167,16 +171,108 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
         return f"[Sell Error] Failed to sell position: {e}"
 
 def to_slug(text: str) -> str:
-    """Converts a market question string into a clean market slug."""
+    """Converts a market question string into a basic slug."""
     s = text.lower().replace("…", "").replace("...", "").replace(" ", "-")
     s = re.sub(r'[^a-z0-9\-]+', '-', s)
     return s.strip('-')
 
+def resolve_exact_slug(market_title: str) -> str:
+    """Resolves exact Polymarket marketSlug for truncated titles or sports events via Gamma API."""
+    clean_title = market_title.replace("…", "").replace("...", "").strip()
+    if not clean_title:
+        return "unknown-market"
+
+    try:
+        q = urllib.parse.quote(clean_title)
+        url = f"https://gamma-api.polymarket.com/events?q={q}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urllib.request.urlopen(req, timeout=4) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode('utf-8'))
+                if isinstance(data, list) and len(data) > 0:
+                    for ev in data:
+                        if isinstance(ev, dict):
+                            if ev.get("slug"):
+                                return ev["slug"]
+                            if ev.get("eventSlug"):
+                                return ev["eventSlug"]
+                            markets = ev.get("markets")
+                            if isinstance(markets, list):
+                                for m in markets:
+                                    if isinstance(m, dict):
+                                        if m.get("marketSlug"):
+                                            return m["marketSlug"]
+                                        if m.get("slug"):
+                                            return m["slug"]
+    except Exception as e:
+        print(f"[Slug Resolve Warning] Gamma API lookup error for '{market_title}': {e}", file=sys.stderr)
+
+    return to_slug(market_title)
+
 def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
-    """Parses wide CLI table output into header text and individual position objects."""
+    """Parses CLI output (JSON or table) into header text and individual position objects."""
     if not raw_output or raw_output.startswith("[Error]") or raw_output.startswith("[Bullpen Error]"):
         return f"```\n{raw_output}\n```", []
 
+    # Attempt parsing structured JSON output
+    try:
+        data = json.loads(raw_output)
+        if isinstance(data, list):
+            parsed_positions = []
+            total_pnl = 0.0
+            for item in data:
+                m_slug = item.get("marketSlug") or item.get("eventSlug") or item.get("slug")
+                title = item.get("title") or item.get("market") or item.get("question") or "Unknown Market"
+                if not m_slug or len(m_slug) < 3 or m_slug.endswith("-"):
+                    m_slug = resolve_exact_slug(title)
+
+                outcome = item.get("outcome") or item.get("outcomeName") or "Yes"
+                status = item.get("status", "open")
+                shares = str(item.get("shares") or item.get("size") or "0")
+
+                entry_val = item.get("avgPrice") or item.get("entry") or 0.0
+                entry = f"${entry_val:.2f}" if isinstance(entry_val, (int, float)) else str(entry_val)
+
+                now_val = item.get("curPrice") or item.get("now") or 0.0
+                now = f"${now_val:.2f}" if isinstance(now_val, (int, float)) else str(now_val)
+
+                val_amt = item.get("currentValue") or item.get("value") or 0.0
+                val = f"${val_amt:.2f}" if isinstance(val_amt, (int, float)) else str(val_amt)
+
+                pnl_num = item.get("pnl", 0.0)
+                if isinstance(pnl_num, (int, float)):
+                    pnl_str = f"-${abs(pnl_num):.2f}" if pnl_num < 0 else f"${pnl_num:.2f}"
+                    total_pnl += pnl_num
+                else:
+                    pnl_str = str(pnl_num)
+
+                roe_num = item.get("percentPnl", item.get("roe", 0.0))
+                if isinstance(roe_num, (int, float)):
+                    roe_str = f"{roe_num:.1f}%"
+                else:
+                    roe_str = str(roe_num)
+
+                parsed_positions.append({
+                    "raw": json.dumps(item),
+                    "market": title,
+                    "slug": m_slug,
+                    "outcome": outcome,
+                    "status": status,
+                    "shares": shares,
+                    "entry": entry,
+                    "now": now,
+                    "value": val,
+                    "pnl": pnl_str,
+                    "roe": roe_str
+                })
+
+            pnl_fmt = f"-${abs(total_pnl):.2f}" if total_pnl < 0 else f"${total_pnl:.2f}"
+            header = f"📊 **Positions ({len(parsed_positions)} open, Total P&L: {pnl_fmt})**\n• _Source: polymarket_\n"
+            return header, parsed_positions
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Table text parsing fallback
     lines = raw_output.splitlines()
     summary_line = ""
     source_line = ""
@@ -216,7 +312,7 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
                 status = tokens[-7]
                 outcome = tokens[-8]
                 market = " ".join(tokens[:-8])
-                slug = to_slug(market)
+                slug = resolve_exact_slug(market)
 
                 parsed_positions.append({
                     "raw": pos,
@@ -260,7 +356,6 @@ async def send_positions_embeds(target, title: str, raw_output: str, addr: str =
 
     cards = [format_card_from_obj(p) for p in pos_objs]
 
-    # Build chunked embeds to stay strictly within Discord limits
     embeds_to_send = []
     current_embed = discord.Embed(
         title=title,
@@ -277,7 +372,6 @@ async def send_positions_embeds(target, title: str, raw_output: str, addr: str =
     for i, card in enumerate(cards, 1):
         card_text = f"{card}\n\n"
 
-        # Check if adding card exceeds 1024 field limit
         if len(current_field_content) + len(card_text) > 1000:
             current_embed.add_field(
                 name=f"Positions ({i - current_field_count} - {i - 1})",
@@ -286,10 +380,8 @@ async def send_positions_embeds(target, title: str, raw_output: str, addr: str =
             )
             current_char_count += len(current_field_content)
             current_field_content = ""
-            current_field_content = ""
             current_field_count = 0
 
-        # Check if embed is full (field count >= 15 or chars > 5000)
         if len(current_embed.fields) >= 15 or current_char_count > EMBED_TOTAL_MAX:
             embeds_to_send.append(current_embed)
             current_embed = discord.Embed(
@@ -315,6 +407,13 @@ async def send_positions_embeds(target, title: str, raw_output: str, addr: str =
     for emb in embeds_to_send:
         await target.send(embed=emb)
 
+async def fetch_positions_output(addr: str = None, src: str = None) -> str:
+    """Attempts fetching positions in JSON mode first, falling back to text mode if necessary."""
+    res = await asyncio.to_thread(run_bullpen_positions, addr, src, True)
+    if res.startswith("[Error]") or res.startswith("[Bullpen Error]") or not res:
+        res = await asyncio.to_thread(run_bullpen_positions, addr, src, False)
+    return res
+
 async def bullpen_watcher_loop():
     """Background task continuously monitoring bullpen positions 24/7 across restarts."""
     global last_periodic_time
@@ -330,7 +429,7 @@ async def bullpen_watcher_loop():
                     auto_close = bullpen_watch_state.get("auto_close_sl", True)
                     periodic_interval = bullpen_watch_state.get("periodic_interval", 300)
 
-                    pos_output = await asyncio.to_thread(run_bullpen_positions, addr, src)
+                    pos_output = await fetch_positions_output(addr, src)
 
                     if pos_output.startswith("[Error]") or pos_output.startswith("[Bullpen Error]"):
                         print(f"[Bullpen Watcher CLI Warning] {pos_output}", file=sys.stderr)
@@ -338,7 +437,6 @@ async def bullpen_watcher_loop():
                         now = time.time()
                         header, pos_objs = parse_positions_to_cards(pos_output)
 
-                        # Check each position against stop loss threshold
                         triggered_positions = []
                         if sl is not None:
                             for p in pos_objs:
@@ -366,7 +464,6 @@ async def bullpen_watcher_loop():
                                     )
                                 await channel.send(embed=embed)
 
-                                # Auto-close breached trades if enabled
                                 if auto_close:
                                     for tp in triggered_positions:
                                         market_slug = tp['slug']
@@ -407,7 +504,6 @@ async def bullpen_watcher_loop():
                                 bullpen_watch_state["sl_alert_fired"] = False
                                 save_watcher_config(bullpen_watch_state)
 
-                        # Periodic 5-minute position report update
                         if last_periodic_time == 0 or (now - last_periodic_time) >= periodic_interval:
                             await send_positions_embeds(
                                 channel,
@@ -707,7 +803,7 @@ async def cmd_open(ctx, *, args: str = ""):
             if m:
                 src = m.group(1)
 
-        output = await asyncio.to_thread(run_bullpen_positions, addr, src)
+        output = await fetch_positions_output(addr, src)
         await send_positions_embeds(ctx, "Bullpen Polymarket Positions", output, addr, src)
 
 @bot.command(name="watchbullpen")
@@ -931,7 +1027,6 @@ async def on_message(message):
         await cmd_open(ctx)
         return
 
-    # Handle watchbullpen without '!' prefix
     if content_lower.startswith("watchbullpen"):
         message.content = "!" + content_raw
 
