@@ -163,6 +163,12 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
     except Exception as e:
         return f"[Sell Error] Failed to sell position: {e}"
 
+def to_slug(text: str) -> str:
+    """Converts a market question string into a clean market slug."""
+    s = text.lower().replace(" ", "-")
+    s = re.sub(r'[^a-z0-9\-]+', '-', s)
+    return s.strip('-')
+
 def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
     """Parses wide CLI table output into header text and individual position objects."""
     if not raw_output or raw_output.startswith("[Error]") or raw_output.startswith("[Bullpen Error]"):
@@ -207,10 +213,12 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
                 status = tokens[-7]
                 outcome = tokens[-8]
                 market = " ".join(tokens[:-8])
+                slug = to_slug(market)
 
                 parsed_positions.append({
                     "raw": pos,
                     "market": market,
+                    "slug": slug,
                     "outcome": outcome,
                     "status": status,
                     "shares": shares,
@@ -225,7 +233,7 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
 def format_card_from_obj(p: dict) -> str:
     pnl_emoji = "🔴" if "-" in p["pnl"] or "-" in p["roe"] else "🟢"
     return (
-        f"📌 **{p['market']}**\n"
+        f"📌 `{p['slug']}`\n"
         f"• Outcome: **{p['outcome']}** | Status: `{p['status']}`\n"
         f"• Shares: `{p['shares']}` | Value: `{p['value']}`\n"
         f"• Entry: `{p['entry']}` ➔ Now: `{p['now']}`\n"
@@ -348,7 +356,7 @@ async def bullpen_watcher_loop():
                                 )
                                 for tp in triggered_positions:
                                     embed.add_field(
-                                        name=f"⚠️ BREACHED: {tp['market']}",
+                                        name=f"⚠️ BREACHED: {tp['slug']}",
                                         value=f"Outcome: **{tp['outcome']}** | Shares: `{tp['shares']}`\nLoss: `{tp['pnl']}` (`{tp['roe']}`)",
                                         inline=False
                                     )
@@ -357,12 +365,11 @@ async def bullpen_watcher_loop():
                                 # Auto-close breached trades if enabled
                                 if auto_close:
                                     for tp in triggered_positions:
-                                        market_slug = tp['market'].lower().replace(" ", "-")
-                                        market_slug = re.sub(r'[^a-z0-9\-]', '', market_slug)
+                                        market_slug = tp['slug']
 
                                         close_embed = discord.Embed(
                                             title=f"⚡ AUTO-CLOSING POSITION",
-                                            description=f"Executing market sell for **{tp['market']}**...",
+                                            description=f"Executing market sell for `{market_slug}`...",
                                             color=discord.Color.orange()
                                         )
                                         await channel.send(embed=close_embed)
@@ -384,7 +391,7 @@ async def bullpen_watcher_loop():
                                         except Exception as se:
                                             err_embed = discord.Embed(
                                                 title="❌ AUTO-CLOSE FAILED",
-                                                description=f"Failed to sell `{tp['market']}`: {se}",
+                                                description=f"Failed to sell `{market_slug}`: {se}",
                                                 color=discord.Color.dark_red()
                                             )
                                             await channel.send(embed=err_embed)
