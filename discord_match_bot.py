@@ -12,7 +12,7 @@ from openai import AsyncOpenAI, APIStatusError
 DEFAULT_MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
 SURPLUS_API_KEY  = os.getenv("SURPLUS_API_KEY")
 SURPLUS_BASE_URL = os.getenv("SURPLUS_API_URL", "https://api.surplusintelligence.ai/min30/v1")
-SURPLUS_MODEL    = os.getenv("SURPLUS_MODEL", "glm-5.2")
+SURPLUS_MODEL    = os.getenv("SURPLUS_MODEL", "gpt-5.4")
 
 # ── discord setup ───────────────────────────────────────────
 intents = discord.Intents.default()
@@ -162,12 +162,17 @@ async def fetch_true_probabilities(match_query: str) -> dict:
             {"role": "user",   "content": USER_PROMPT_TEMPLATE.format(match=match_query)}
         ],
         temperature=0.1,
-        max_tokens=600,
+        max_tokens=2000,  # bumped for reasoning models (glm-5.2 uses reasoning_content)
     )
-    raw = response.choices[0].message.content or ""
+    msg = response.choices[0].message
+
+    # reasoning models (glm-5.2) put output in reasoning_content, not content
+    raw = msg.content or ""
+    if not raw and hasattr(msg, "reasoning_content") and msg.reasoning_content:
+        raw = msg.reasoning_content
 
     # dump to stderr
-    print(f"\nLLM RAW: {repr(raw)[:2000]}\n", file=sys.stderr)
+    print(f"\nLLM RAW ({SURPLUS_MODEL}): {repr(raw)[:2000]}\n", file=sys.stderr)
 
     json_str = extract_json(raw)
     data = _try_json_parse(json_str)
