@@ -470,6 +470,39 @@ async def fetch_positions_output(addr: str = None, src: str = None) -> str:
         res = await asyncio.to_thread(run_bullpen_positions, addr, src, False)
     return res
 
+async def close_position_task(channel, tp: dict):
+    """Executes a single market sell asynchronously in parallel."""
+    market_slug = tp['slug']
+    close_embed = discord.Embed(
+        title="⚡ AUTO-CLOSING POSITION",
+        description=f"Executing market sell for `{market_slug}`...",
+        color=discord.Color.orange()
+    )
+    await channel.send(embed=close_embed)
+
+    try:
+        shares_num = float(tp['shares'])
+        sell_res = await asyncio.to_thread(
+            execute_bullpen_sell,
+            market_slug,
+            tp['outcome'],
+            shares_num
+        )
+        is_err = "Error" in sell_res or "[Sell Error]" in sell_res
+        res_embed = discord.Embed(
+            title="✅ POSITION CLOSED" if not is_err else "❌ AUTO-CLOSE RESULT",
+            description=f"Market: `{market_slug}`\n```\n{_trunc(sell_res, 1800)}\n```",
+            color=discord.Color.green() if not is_err else discord.Color.red()
+        )
+        await channel.send(embed=res_embed)
+    except Exception as se:
+        err_embed = discord.Embed(
+            title="❌ AUTO-CLOSE FAILED",
+            description=f"Failed to sell `{market_slug}`: {se}",
+            color=discord.Color.dark_red()
+        )
+        await channel.send(embed=err_embed)
+
 async def bullpen_watcher_loop():
     """Background task continuously monitoring bullpen positions 24/7 across restarts."""
     global last_periodic_time
@@ -521,37 +554,9 @@ async def bullpen_watcher_loop():
                                 await channel.send(embed=embed)
 
                                 if auto_close:
-                                    for tp in triggered_positions:
-                                        market_slug = tp['slug']
-
-                                        close_embed = discord.Embed(
-                                            title=f"⚡ AUTO-CLOSING POSITION",
-                                            description=f"Executing market sell for `{market_slug}`...",
-                                            color=discord.Color.orange()
-                                        )
-                                        await channel.send(close_embed)
-
-                                        try:
-                                            shares_num = float(tp['shares'])
-                                            sell_res = await asyncio.to_thread(
-                                                execute_bullpen_sell,
-                                                market_slug,
-                                                tp['outcome'],
-                                                shares_num
-                                            )
-                                            res_embed = discord.Embed(
-                                                title="✅ POSITION CLOSED / RESULT",
-                                                description=f"```\n{_trunc(sell_res, 2000)}\n```",
-                                                color=discord.Color.green() if not "Error" in sell_res else discord.Color.red()
-                                            )
-                                            await channel.send(embed=res_embed)
-                                        except Exception as se:
-                                            err_embed = discord.Embed(
-                                                title="❌ AUTO-CLOSE FAILED",
-                                                description=f"Failed to sell `{market_slug}`: {se}",
-                                                color=discord.Color.dark_red()
-                                            )
-                                            await channel.send(embed=err_embed)
+                                    # Execute all stop-loss sells concurrently in parallel
+                                    close_tasks = [close_position_task(channel, tp) for tp in triggered_positions]
+                                    await asyncio.gather(*close_tasks)
 
                                 bullpen_watch_state["sl_alert_fired"] = True
                                 save_watcher_config(bullpen_watch_state)
@@ -942,7 +947,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
             f"• Target Channel: <#{target_ch}>\n"
             f"• Monitoring Interval: `{interval}s` (SL check)\n"
             f"• Stop Loss Trigger: `{sl_desc}`\n"
-            f"• Auto-Close Action: ⚡ `bullpen polymarket sell` (Executes automatically when SL breaches)\n"
+            f"• Auto-Close Action: ⚡ Concurrent `bullpen polymarket sell` (Executes all triggered sells in parallel)\n"
             f"• Periodic Report: Every 5 minutes\n"
             f"• Quick fetch: Type `open` or `!open` anytime to push current positions up."
         )
@@ -1117,7 +1122,7 @@ async def on_ready():
     print(f"online: {bot.user.name} ({bot.user.id})")
     print(f"model: {SURPLUS_MODEL}  |  base_url: {SURPLUS_BASE_URL}")
     if bullpen_watch_state.get("task") is None:
-        bullpen_watch_state["task"] = asyncio.create_task(bullpen_watcher_loop())
+        bullpen_watch_state["task"] = asyncio.task = asyncio.create_task(bullpen_watcher_loop())
     if bullpen_watch_state.get("active"):
         target_ch = bullpen_watch_state.get('channel_id') or MONITOR_CHANNEL_ID
         print(f"[INFO] bullpen watcher auto-started from config for channel {target_ch}")
