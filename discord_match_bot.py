@@ -474,12 +474,15 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
 
     if act == "status":
         target_ch = bullpen_watch_state.get('channel_id') or MONITOR_CHANNEL_ID
+        is_active = "🟢 Active (24/7 Monitoring)" if bullpen_watch_state.get("active") else "🔴 Stopped"
+        sl_val = bullpen_watch_state.get("stop_loss")
+        sl_str = f"{sl_val}%" if sl_val is not None else "None"
         status_str = (
-            f"**Status:** {'🟢 Active (24/7 Monitoring)' if bullpen_watch_state.get('active') else '🔴 Stopped'}\n"
+            f"**Status:** {is_active}\n"
             f"**Channel:** <#{target_ch}>\n"
             f"**Address:** `{bullpen_watch_state.get('address') or 'Default'}`\n"
             f"**Source:** `{bullpen_watch_state.get('source') or 'Default'}`\n"
-            f"**Stop Loss:** `{f'{bullpen_watch_state.get(\"stop_loss\")}%' if bullpen_watch_state.get('stop_loss') else 'None'}`\n"
+            f"**Stop Loss:** `{sl_str}`\n"
             f"**Interval:** `{bullpen_watch_state.get('interval', 2)}s`"
         )
         await ctx.send(embed=discord.Embed(title="Bullpen Watcher Status", description=status_str, color=discord.Color.blue()))
@@ -520,13 +523,14 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
 
         save_watcher_config(bullpen_watch_state)
 
+        sl_desc = f"{sl}%" if sl is not None else "Disabled"
         msg = (
             f"🟢 **Started 24/7 background watching of Bullpen positions!**\n"
             f"• Target Channel: <#{target_ch}>\n"
             f"• Interval: `{interval}s`\n"
             f"• Address: `{addr or 'Default'}`\n"
             f"• Source: `{src or 'Default'}`\n"
-            f"• Stop Loss Trigger: `{f'{sl}%' if sl else 'Disabled'}`\n"
+            f"• Stop Loss Trigger: `{sl_desc}`\n"
             f"• Configuration saved to disk — will automatically resume across restarts."
         )
         await ctx.send(msg)
