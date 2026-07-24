@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import ast
 import sys
 import discord
 from discord.ext import commands
@@ -66,62 +67,76 @@ PROB_KEYS = {"home_win", "draw", "away_win"}
 FACTOR_KEYS = {"home_form", "away_form", "home_absences", "away_absences", "tactical_edge"}
 
 def _strip_control_chars(s: str) -> str:
-    """remove all ascii control characters except \n and \t, which json tolerates inside strings."""
+    """remove all ascii control characters except space, \\n, \\t."""
     return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', s)
 
-def _clean_braced(json_str: str) -> str:
-    """remove trailing commas before closing } or ] — common llm mistake."""
+def _strip_trailing_commas(json_str: str) -> str:
+    """remove trailing commas before closing } or ]."""
     return re.sub(r',\s*([]}])', r'\1', json_str)
 
-def _extract_braced(text: str) -> str:
-    """find first { and matching } via depth counting."""
-    start = text.find('{')
-    if start == -1:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0:
-                return text[start:i+1]
-    return None
-
 def extract_json(raw: str) -> str:
-    """aggressive json extraction — handles every llm output format."""
+    """
+    aggressive json extraction.
+    handles: markdown code blocks, braced json, bare key:value pairs,
+    responses that start with a newline, stray text around json, etc.
+    """
     if not raw:
         raise ValueError("empty response from llm")
 
-    raw = _strip_control_chars(raw).strip().lstrip("\ufeff\u200b\u200c\u200d\u2060")
+    raw = _strip_control_chars(raw)
+    raw = raw.strip().lstrip("\ufeff\u200b\u200c\u200d\u2060")
 
     # case 1: markdown code block ```json ... ``` or ``` ... ```
-    m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL)
+    m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL | re.IGNORECASE)
     if m:
         inner = m.group(1).strip()
-        braced = _extract_braced(inner)
-        if braced:
-            return _clean_braced(braced)
+        if inner:
+            return _strip_trailing_commas(inner)
 
-    # case 2: has opening brace — extract it
-    braced = _extract_braced(raw)
-    if braced:
-        return _clean_braced(braced)
+    # case 2: find { ... } via brace counting
+    start = raw.find('{')
+    if start != -1:
+        depth = 0
+        for i in range(start, len(raw)):
+            ch = raw[i]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return _strip_trailing_commas(raw[start:i+1])
 
     # case 3: no braces — model returned bare key:value pairs.
-    # strip all whitespace/newlines between fields, wrap in {}
-    bare = raw.strip()
-    if bare.startswith('"'):
-        # collapse internal whitespace between kv pairs but keep string values intact
+    # try to wrap in {}. first strip any leading/trailing non-json cruft.
+    # the model might return something like: \n"match_name": "...", ...
+    bare = raw.strip().lstrip(',').strip()
+    
+    # if it looks like json key:value pairs, wrap it
+    if '"' in bare and ':' in bare:
         wrapped = "{" + bare + "}"
-        wrapped = _clean_braced(wrapped)
+        wrapped = _strip_trailing_commas(wrapped)
         return wrapped
 
-    # nothing worked — diagnostic
-    raise ValueError(
-        f"cannot extract json from llm response. first 500 chars: {raw[:500]}"
-    )
+    # case 4: nothing worked, return raw for diagnostic
+    raise ValueError(f"cannot extract json. raw[:500]: {raw[:500]}")
+
+def _try_json_parse(text: str) -> dict:
+    """try json.loads, then ast.literal_eval as fallback."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # try ast.literal_eval — handles python-style dicts, single-quoted strings, etc.
+    try:
+        result = ast.literal_eval(text)
+        if isinstance(result, dict):
+            # recursively convert any values that might be python types
+            return json.loads(json.dumps(result))
+    except (ValueError, SyntaxError, TypeError):
+        pass
+
+    raise ValueError(f"cannot parse as json or python dict. text[:500]: {text[:500]}")
 
 def validate_llm_output(data: dict) -> dict:
     """strict output validation — raises on schema violation."""
@@ -148,19 +163,6 @@ def validate_llm_output(data: dict) -> dict:
 
     return data
 
-def parse_llm_response(raw: str) -> dict:
-    """extract json from llm response and validate it."""
-    json_str = extract_json(raw)
-    try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"json decode failed: {e}\n"
-            f"extracted json: {json_str[:500]}\n"
-            f"raw: {raw[:500]}"
-        )
-    return validate_llm_output(data)
-
 # ── api client ──────────────────────────────────────────────
 
 def get_surplus_client() -> AsyncOpenAI:
@@ -178,16 +180,26 @@ async def fetch_true_probabilities(match_query: str) -> dict:
         ],
         temperature=0.1,
         max_tokens=600,
-        response_format={"type": "json_object"},
     )
-    raw = response.choices[0].message.content
+    raw = response.choices[0].message.content or ""
 
+    # always dump to stderr for debugging
     print(f"\n{'='*60}", file=sys.stderr)
     print(f"LLM RAW RESPONSE:", file=sys.stderr)
     print(repr(raw), file=sys.stderr)
     print(f"{'='*60}\n", file=sys.stderr)
 
-    return parse_llm_response(raw)
+    try:
+        json_str = extract_json(raw)
+        data = _try_json_parse(json_str)
+        return validate_llm_output(data)
+    except ValueError as e:
+        # include the full raw response in the error so user can paste it
+        raise ValueError(
+            f"{e}\n\n"
+            f"**Full raw response from {SURPLUS_MODEL}:**\n"
+            f"```\n{raw}\n```"
+        )
 
 # ── edge calculation ────────────────────────────────────────
 
