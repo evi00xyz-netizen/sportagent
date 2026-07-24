@@ -1,0 +1,28 @@
+[Unit]
+Description=SportAgent Discord Match Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/sportagent
+EnvironmentFile=/root/sportagent/.env
+ExecStart=/root/sportagent/venv/bin/python /root/sportagent/discord_match_bot.py
+
+# auto-restart on crash
+Restart=always
+RestartSec=10
+
+# stop gracefully (SIGTERM, wait 15s, then SIGKILL)
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# log to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sportagent
+
+[Install]
+WantedBy=multi-user.target
