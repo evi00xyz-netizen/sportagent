@@ -3,9 +3,10 @@ import json
 import re
 import ast
 import sys
+import traceback
 import discord
 from discord.ext import commands
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIStatusError
 
 # ── env config ──────────────────────────────────────────────
 DEFAULT_MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
@@ -75,18 +76,14 @@ def _strip_trailing_commas(json_str: str) -> str:
     return re.sub(r',\s*([]}])', r'\1', json_str)
 
 def extract_json(raw: str) -> str:
-    """
-    aggressive json extraction.
-    handles: markdown code blocks, braced json, bare key:value pairs,
-    responses that start with a newline, stray text around json, etc.
-    """
+    """aggressive json extraction."""
     if not raw:
         raise ValueError("empty response from llm")
 
     raw = _strip_control_chars(raw)
     raw = raw.strip().lstrip("\ufeff\u200b\u200c\u200d\u2060")
 
-    # case 1: markdown code block ```json ... ``` or ``` ... ```
+    # case 1: markdown code block
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL | re.IGNORECASE)
     if m:
         inner = m.group(1).strip()
@@ -106,61 +103,45 @@ def extract_json(raw: str) -> str:
                 if depth == 0:
                     return _strip_trailing_commas(raw[start:i+1])
 
-    # case 3: no braces — model returned bare key:value pairs.
-    # try to wrap in {}. first strip any leading/trailing non-json cruft.
-    # the model might return something like: \n"match_name": "...", ...
+    # case 3: no braces — bare key:value pairs
     bare = raw.strip().lstrip(',').strip()
-    
-    # if it looks like json key:value pairs, wrap it
     if '"' in bare and ':' in bare:
         wrapped = "{" + bare + "}"
-        wrapped = _strip_trailing_commas(wrapped)
-        return wrapped
+        return _strip_trailing_commas(wrapped)
 
-    # case 4: nothing worked, return raw for diagnostic
-    raise ValueError(f"cannot extract json. raw[:500]: {raw[:500]}")
+    raise ValueError(f"cannot extract json from: {raw[:500]}")
 
 def _try_json_parse(text: str) -> dict:
-    """try json.loads, then ast.literal_eval as fallback."""
+    """try json.loads, then ast.literal_eval."""
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-
-    # try ast.literal_eval — handles python-style dicts, single-quoted strings, etc.
     try:
         result = ast.literal_eval(text)
         if isinstance(result, dict):
-            # recursively convert any values that might be python types
             return json.loads(json.dumps(result))
     except (ValueError, SyntaxError, TypeError):
         pass
-
     raise ValueError(f"cannot parse as json or python dict. text[:500]: {text[:500]}")
 
 def validate_llm_output(data: dict) -> dict:
-    """strict output validation — raises on schema violation."""
     missing = REQUIRED_KEYS - set(data.keys())
     if missing:
         raise ValueError(f"missing top-level keys: {missing}")
-
     tp = data["true_probabilities"]
     missing_p = PROB_KEYS - set(tp.keys())
     if missing_p:
         raise ValueError(f"missing probability keys: {missing_p}")
-
     total = tp["home_win"] + tp["draw"] + tp["away_win"]
     if abs(total - 1.0) > 0.015:
         raise ValueError(f"probabilities sum to {total:.4f}, expected 1.0")
-
     mf = data["matrix_factors"]
     missing_f = FACTOR_KEYS - set(mf.keys())
     if missing_f:
         raise ValueError(f"missing factor keys: {missing_f}")
-
     if not isinstance(data["confidence"], (int, float)):
         raise ValueError("confidence must be numeric")
-
     return data
 
 # ── api client ──────────────────────────────────────────────
@@ -183,39 +164,25 @@ async def fetch_true_probabilities(match_query: str) -> dict:
     )
     raw = response.choices[0].message.content or ""
 
-    # always dump to stderr for debugging
-    print(f"\n{'='*60}", file=sys.stderr)
-    print(f"LLM RAW RESPONSE:", file=sys.stderr)
-    print(repr(raw), file=sys.stderr)
-    print(f"{'='*60}\n", file=sys.stderr)
+    # dump to stderr
+    print(f"\nLLM RAW: {repr(raw)[:2000]}\n", file=sys.stderr)
 
-    try:
-        json_str = extract_json(raw)
-        data = _try_json_parse(json_str)
-        return validate_llm_output(data)
-    except ValueError as e:
-        # include the full raw response in the error so user can paste it
-        raise ValueError(
-            f"{e}\n\n"
-            f"**Full raw response from {SURPLUS_MODEL}:**\n"
-            f"```\n{raw}\n```"
-        )
+    json_str = extract_json(raw)
+    data = _try_json_parse(json_str)
+    return validate_llm_output(data)
 
 # ── edge calculation ────────────────────────────────────────
 
 def calculate_edges(true_probs: dict, odds_home: float = None, odds_draw: float = None, odds_away: float = None):
     if not odds_home or not odds_away:
         return None
-
     raw_h = 1.0 / odds_home
     raw_d = (1.0 / odds_draw) if odds_draw else 0.0
     raw_a = 1.0 / odds_away
     total = raw_h + raw_d + raw_a
-
     imp_h = raw_h / total
     imp_d = raw_d / total if odds_draw else 0.0
     imp_a = raw_a / total
-
     return {
         "implied": {"home": imp_h, "draw": imp_d, "away": imp_a},
         "edges": {
@@ -236,10 +203,6 @@ async def cmd_set_min_edge(ctx, edge_pct: float):
 
 @bot.command(name="match")
 async def cmd_match(ctx, *, args: str):
-    """
-    !match Arsenal vs Chelsea
-    !match Arsenal vs Chelsea | odds: 2.10, 3.40, 3.20
-    """
     async with ctx.typing():
         match_query = args
         oh = od = oa = None
@@ -263,8 +226,22 @@ async def cmd_match(ctx, *, args: str):
 
         try:
             data = await fetch_true_probabilities(match_query)
+        except APIStatusError as e:
+            # surplus API returned an error — show it in full
+            await ctx.send(
+                f"**Surplus API error** (status {e.status_code}):\n"
+                f"```\n{e.message}\n```\n"
+                f"**Check:** model name `{SURPLUS_MODEL}`, base URL `{SURPLUS_BASE_URL}`, API key valid?"
+            )
+            return
         except Exception as e:
-            await ctx.send(f"**error**: {e}")
+            # any other error — include full traceback so we can debug
+            tb = traceback.format_exc()
+            short_tb = tb[-1500:] if len(tb) > 1500 else tb
+            await ctx.send(
+                f"**Error**: {type(e).__name__}: {e}\n"
+                f"```\n{short_tb}\n```"
+            )
             return
 
         tp  = data["true_probabilities"]
