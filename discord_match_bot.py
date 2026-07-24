@@ -1,14 +1,13 @@
 import os
 import json
-import asyncio
-import aiohttp
 import discord
 from discord.ext import commands
-import openai
+from openai import AsyncOpenAI
 
 # ── env config ──────────────────────────────────────────────
 DEFAULT_MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
 OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")
+SURPLUS_MODEL   = os.getenv("SURPLUS_MODEL", "glm-5.2")
 
 # ── discord setup ───────────────────────────────────────────
 intents = discord.Intents.default()
@@ -94,28 +93,38 @@ def validate_llm_output(data: dict) -> dict:
 
 # ── api clients ─────────────────────────────────────────────
 
-async def fetch_from_custom_api(match_query: str, api_url: str, api_key: str = None) -> dict:
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-        headers["x-api-key"] = api_key
+def get_surplus_client() -> AsyncOpenAI:
+    """returns an openai-compatible client pointed at surplus intelligence."""
+    api_key = os.getenv("SURPLUS_API_KEY")
+    base_url = os.getenv("SURPLUS_API_URL", "https://api.surplusintelligence.ai/min30/v1")
+    if not api_key:
+        raise Exception("SURPLUS_API_KEY not set")
+    return AsyncOpenAI(api_key=api_key, base_url=base_url)
 
-    payload = {"match": match_query, "mode": "probability_matrix", "exclude_odds": True}
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(api_url, json=payload, headers=headers, timeout=30) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise Exception(f"custom api {resp.status}: {body[:300]}")
-            return await resp.json()
-
-async def fetch_from_openai(match_query: str) -> dict:
+def get_openai_client() -> AsyncOpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise Exception("OPENAI_API_KEY not set")
+    return AsyncOpenAI(api_key=api_key)
 
-    client = openai.AsyncOpenAI(api_key=api_key)
+async def fetch_from_surplus(match_query: str) -> dict:
+    client = get_surplus_client()
+    response = await client.chat.completions.create(
+        model=SURPLUS_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": USER_PROMPT_TEMPLATE.format(match=match_query)}
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
+        max_tokens=600
+    )
+    raw = response.choices[0].message.content
+    data = json.loads(raw)
+    return validate_llm_output(data)
 
+async def fetch_from_openai(match_query: str) -> dict:
+    client = get_openai_client()
     response = await client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
@@ -123,19 +132,16 @@ async def fetch_from_openai(match_query: str) -> dict:
             {"role": "user",   "content": USER_PROMPT_TEMPLATE.format(match=match_query)}
         ],
         response_format={"type": "json_object"},
-        temperature=0.1,       # minimal variance for probability work
-        max_tokens=600         # cap output — schema is tight
+        temperature=0.1,
+        max_tokens=600
     )
-
     raw = response.choices[0].message.content
     data = json.loads(raw)
     return validate_llm_output(data)
 
 async def fetch_true_probabilities(match_query: str) -> dict:
-    custom_url = os.getenv("SURPLUS_API_URL")
-    custom_key = os.getenv("SURPLUS_API_KEY")
-    if custom_url:
-        return await fetch_from_custom_api(match_query, custom_url, custom_key)
+    if os.getenv("SURPLUS_API_KEY"):
+        return await fetch_from_surplus(match_query)
     return await fetch_from_openai(match_query)
 
 # ── edge calculation ────────────────────────────────────────
@@ -207,7 +213,7 @@ async def cmd_match(ctx, *, args: str):
         tp  = data["true_probabilities"]
         mf  = data["matrix_factors"]
         fc  = data.get("forecast", "N/A")
-        src = "Surplus API" if os.getenv("SURPLUS_API_URL") else f"OpenAI ({OPENAI_MODEL})"
+        src = f"Surplus ({SURPLUS_MODEL})" if os.getenv("SURPLUS_API_KEY") else f"OpenAI ({OPENAI_MODEL})"
 
         embed = discord.Embed(
             title=f"Matrix: {data.get('match_name', match_query)}",
@@ -248,7 +254,6 @@ async def cmd_match(ctx, *, args: str):
 
             embed.add_field(name="Market Edge", value="\n".join(edge_lines), inline=False)
 
-            # value bets
             bets = []
             if edges["home"] >= min_edge:
                 bets.append(f"Home ({data.get('home_team')}): {edges['home']*100:+.1f}%")
