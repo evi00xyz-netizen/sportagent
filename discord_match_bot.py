@@ -31,8 +31,8 @@ def set_min_edge(guild_id: int, edge: float):
 # ── strict llm input schema ─────────────────────────────────
 SYSTEM_PROMPT = (
     "You are a sports probability matrix engine. "
-    "Output ONLY valid JSON matching the schema. "
-    "Never use or reference betting odds, bookmaker lines, or market prices. "
+    "Output ONLY valid JSON. Do not include markdown, code blocks, or any text outside the JSON. "
+    "Never reference betting odds, bookmaker lines, or market prices. "
     "Base probabilities solely on fundamental match data."
 )
 
@@ -65,6 +65,14 @@ REQUIRED_KEYS = {
 PROB_KEYS = {"home_win", "draw", "away_win"}
 FACTOR_KEYS = {"home_form", "away_form", "home_absences", "away_absences", "tactical_edge"}
 
+def _strip_control_chars(s: str) -> str:
+    """remove all ascii control characters except \n and \t, which json tolerates inside strings."""
+    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', s)
+
+def _clean_braced(json_str: str) -> str:
+    """remove trailing commas before closing } or ] — common llm mistake."""
+    return re.sub(r',\s*([]}])', r'\1', json_str)
+
 def _extract_braced(text: str) -> str:
     """find first { and matching } via depth counting."""
     start = text.find('{')
@@ -86,38 +94,33 @@ def extract_json(raw: str) -> str:
     if not raw:
         raise ValueError("empty response from llm")
 
-    # strip BOM, zero-width chars, all unicode whitespace
-    raw = raw.strip().lstrip("\ufeff\u200b\u200c\u200d\u2060")
+    raw = _strip_control_chars(raw).strip().lstrip("\ufeff\u200b\u200c\u200d\u2060")
 
     # case 1: markdown code block ```json ... ``` or ``` ... ```
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL)
     if m:
         inner = m.group(1).strip()
-        if inner:
-            braced = _extract_braced(inner)
-            if braced:
-                return braced
-            # fall through — maybe the inner content is unbraced json fields
+        braced = _extract_braced(inner)
+        if braced:
+            return _clean_braced(braced)
 
     # case 2: has opening brace — extract it
     braced = _extract_braced(raw)
     if braced:
-        return braced
+        return _clean_braced(braced)
 
-    # case 3: no braces — model returned bare key:value pairs. wrap in {}
-    # this happens with some models that strip the outer braces
+    # case 3: no braces — model returned bare key:value pairs.
+    # strip all whitespace/newlines between fields, wrap in {}
     bare = raw.strip()
     if bare.startswith('"'):
+        # collapse internal whitespace between kv pairs but keep string values intact
         wrapped = "{" + bare + "}"
-        # verify it has a closing by checking if wrapping makes sense
-        if wrapped.count('{') == wrapped.count('}'):
-            return wrapped
+        wrapped = _clean_braced(wrapped)
+        return wrapped
 
-    # nothing worked — diagnostic info
-    snippet = raw[:500]
+    # nothing worked — diagnostic
     raise ValueError(
-        f"cannot extract json from llm response. "
-        f"first 500 chars: {snippet}"
+        f"cannot extract json from llm response. first 500 chars: {raw[:500]}"
     )
 
 def validate_llm_output(data: dict) -> dict:
@@ -152,9 +155,9 @@ def parse_llm_response(raw: str) -> dict:
         data = json.loads(json_str)
     except json.JSONDecodeError as e:
         raise ValueError(
-            f"invalid json from llm: {e}\n"
-            f"extracted (first 500 chars): {json_str[:500]}\n"
-            f"raw (first 500 chars): {raw[:500]}"
+            f"json decode failed: {e}\n"
+            f"extracted json: {json_str[:500]}\n"
+            f"raw: {raw[:500]}"
         )
     return validate_llm_output(data)
 
@@ -175,6 +178,7 @@ async def fetch_true_probabilities(match_query: str) -> dict:
         ],
         temperature=0.1,
         max_tokens=600,
+        response_format={"type": "json_object"},
     )
     raw = response.choices[0].message.content
 
