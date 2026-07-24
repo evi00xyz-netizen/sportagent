@@ -21,8 +21,9 @@ SURPLUS_MODEL    = os.getenv("SURPLUS_MODEL", "gpt-5.4")
 CONFIG_FILE      = "watcher_config.json"
 MONITOR_CHANNEL_ID = 1530286757126471822
 
-# discord embed field limit
+# discord limits
 EMBED_FIELD_MAX = 1024
+EMBED_TOTAL_MAX = 5500
 
 def _trunc(s: str, max_len: int = EMBED_FIELD_MAX) -> str:
     if len(s) <= max_len:
@@ -142,10 +143,10 @@ def run_bullpen_positions(address: str = None, source: str = None) -> str:
     except Exception as e:
         return f"[Error] Failed to execute bullpen CLI: {e}"
 
-def format_positions_mobile(raw_output: str) -> str:
-    """Parses wide CLI table output into clean vertical cards ideal for mobile Discord display."""
+def parse_positions_to_cards(raw_output: str) -> tuple[str, list[str]]:
+    """Parses wide CLI table output into header text and individual mobile card strings."""
     if not raw_output or raw_output.startswith("[Error]") or raw_output.startswith("[Bullpen Error]"):
-        return f"```\n{raw_output}\n```"
+        return f"```\n{raw_output}\n```", []
 
     lines = raw_output.splitlines()
     summary_line = ""
@@ -166,15 +167,14 @@ def format_positions_mobile(raw_output: str) -> str:
         elif table_started:
             position_lines.append(l)
 
-    formatted_blocks = []
-
+    header = ""
     if summary_line:
-        formatted_blocks.append(f"📊 **{summary_line}**")
+        header += f"📊 **{summary_line}**\n"
     if source_line:
-        formatted_blocks.append(f"• _{source_line}_")
+        header += f"• _{source_line}_\n"
 
+    cards = []
     if position_lines:
-        formatted_blocks.append("")
         for pos in position_lines:
             tokens = pos.split()
             if len(tokens) >= 9:
@@ -197,15 +197,79 @@ def format_positions_mobile(raw_output: str) -> str:
                     f"• Entry: `{entry}` ➔ Now: `{now}`\n"
                     f"• P&L: {pnl_emoji} `{pnl}` (`{roe}`)"
                 )
-                formatted_blocks.append(card)
+                cards.append(card)
             else:
-                formatted_blocks.append(f"`{pos}`")
-    elif "No open positions" in raw_output or "0 open" in raw_output:
-        formatted_blocks.append("\n_No open positions found._")
-    else:
-        return f"```\n{_trunc(raw_output, 2000)}\n```"
+                cards.append(f"`{pos}`")
+    return header, cards
 
-    return "\n".join(formatted_blocks)
+async def send_positions_embeds(target, title: str, raw_output: str, addr: str = None, src: str = None):
+    """Sends positions as nicely chunked mobile cards across fields/embeds so no trades are cut off."""
+    header, cards = parse_positions_to_cards(raw_output)
+
+    if not cards:
+        embed = discord.Embed(
+            title=title,
+            description=header or f"```\n{_trunc(raw_output, 2000)}\n```",
+            color=discord.Color.gold()
+        )
+        if addr: embed.add_field(name="Address", value=addr, inline=True)
+        if src: embed.add_field(name="Source", value=src, inline=True)
+        await target.send(embed=embed)
+        return
+
+    # Build chunked embeds to stay strictly within Discord limits
+    embeds_to_send = []
+    current_embed = discord.Embed(
+        title=title,
+        description=header,
+        color=discord.Color.gold()
+    )
+    if addr: current_embed.add_field(name="Address", value=addr, inline=True)
+    if src: current_embed.add_field(name="Source", value=src, inline=True)
+
+    current_field_content = ""
+    current_field_count = 0
+    current_char_count = len(title) + len(header)
+
+    for i, card in enumerate(cards, 1):
+        card_text = f"{card}\n\n"
+
+        # Check if adding card exceeds 1024 field limit
+        if len(current_field_content) + len(card_text) > 1000:
+            current_embed.add_field(
+                name=f"Positions ({i - current_field_count} - {i - 1})",
+                value=current_field_content.strip(),
+                inline=False
+            )
+            current_char_count += len(current_field_content)
+            current_field_content = ""
+            current_field_count = 0
+
+        # Check if embed is full (field count >= 20 or chars > 5000)
+        if len(current_embed.fields) >= 15 or current_char_count > EMBED_TOTAL_MAX:
+            embeds_to_send.append(current_embed)
+            current_embed = discord.Embed(
+                title=f"{title} (Cont.)",
+                color=discord.Color.gold()
+            )
+            current_char_count = len(title)
+
+        current_field_content += card_text
+        current_field_count += 1
+
+    if current_field_content:
+        total_cards = len(cards)
+        start_idx = total_cards - current_field_count + 1
+        current_embed.add_field(
+            name=f"Positions ({start_idx} - {total_cards})" if total_cards > 1 else "Open Positions",
+            value=current_field_content.strip(),
+            inline=False
+        )
+
+    embeds_to_send.append(current_embed)
+
+    for emb in embeds_to_send:
+        await target.send(embed=emb)
 
 async def bullpen_watcher_loop():
     """Background task continuously monitoring bullpen positions 24/7 across restarts."""
@@ -238,17 +302,15 @@ async def bullpen_watcher_loop():
                                     sl_triggered = True
                                     break
 
-                        mobile_text = format_positions_mobile(pos_output)
-
                         if sl_triggered:
                             if not bullpen_watch_state.get("sl_alert_fired", False):
-                                embed = discord.Embed(
-                                    title="🚨 BULLPEN STOP LOSS TRIGGERED",
-                                    description=f"Stop Loss threshold of `{sl}%` reached/exceeded!",
-                                    color=discord.Color.red()
+                                await send_positions_embeds(
+                                    channel,
+                                    f"🚨 BULLPEN STOP LOSS TRIGGERED ({sl}%)",
+                                    pos_output,
+                                    addr,
+                                    src
                                 )
-                                embed.add_field(name="Current Positions", value=_trunc(mobile_text, 1024), inline=False)
-                                await channel.send(embed=embed)
                                 bullpen_watch_state["sl_alert_fired"] = True
                                 save_watcher_config(bullpen_watch_state)
                         else:
@@ -258,12 +320,13 @@ async def bullpen_watcher_loop():
 
                         # Periodic 5-minute position report update
                         if last_periodic_time == 0 or (now - last_periodic_time) >= periodic_interval:
-                            embed = discord.Embed(
-                                title="📊 Bullpen 5-Min Position Report",
-                                description=_trunc(mobile_text, 4000),
-                                color=discord.Color.blue()
+                            await send_positions_embeds(
+                                channel,
+                                "📊 Bullpen 5-Min Position Report",
+                                pos_output,
+                                addr,
+                                src
                             )
-                            await channel.send(embed=embed)
                             last_periodic_time = now
 
                         if pos_output != bullpen_watch_state.get("last_positions"):
@@ -556,18 +619,7 @@ async def cmd_open(ctx, *, args: str = ""):
                 src = m.group(1)
 
         output = await asyncio.to_thread(run_bullpen_positions, addr, src)
-        mobile_formatted = format_positions_mobile(output)
-
-        embed = discord.Embed(
-            title="Bullpen Polymarket Positions",
-            description=_trunc(mobile_formatted, 4000),
-            color=discord.Color.gold()
-        )
-        if addr:
-            embed.add_field(name="Address", value=addr, inline=True)
-        if src:
-            embed.add_field(name="Source", value=src, inline=True)
-        await ctx.send(embed=embed)
+        await send_positions_embeds(ctx, "Bullpen Polymarket Positions", output, addr, src)
 
 @bot.command(name="watchbullpen")
 async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
