@@ -160,12 +160,15 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
         return res.stdout.strip()
     except subprocess.TimeoutExpired:
         return "[Error] `bullpen polymarket sell` command timed out."
+    except subprocess.CalledProcessError as e:
+        err_out = e.stderr.strip() or e.stdout.strip()
+        return f"[Sell Error] Exit code {e.returncode}: {err_out}"
     except Exception as e:
         return f"[Sell Error] Failed to sell position: {e}"
 
 def to_slug(text: str) -> str:
     """Converts a market question string into a clean market slug."""
-    s = text.lower().replace(" ", "-")
+    s = text.lower().replace("…", "").replace("...", "").replace(" ", "-")
     s = re.sub(r'[^a-z0-9\-]+', '-', s)
     return s.strip('-')
 
@@ -283,6 +286,7 @@ async def send_positions_embeds(target, title: str, raw_output: str, addr: str =
             )
             current_char_count += len(current_field_content)
             current_field_content = ""
+            current_field_content = ""
             current_field_count = 0
 
         # Check if embed is full (field count >= 15 or chars > 5000)
@@ -383,9 +387,9 @@ async def bullpen_watcher_loop():
                                                 shares_num
                                             )
                                             res_embed = discord.Embed(
-                                                title="✅ POSITION CLOSED",
+                                                title="✅ POSITION CLOSED / RESULT",
                                                 description=f"```\n{_trunc(sell_res, 2000)}\n```",
-                                                color=discord.Color.green()
+                                                color=discord.Color.green() if not "Error" in sell_res else discord.Color.red()
                                             )
                                             await channel.send(embed=res_embed)
                                         except Exception as se:
