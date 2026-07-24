@@ -177,102 +177,101 @@ async def cmd_match(ctx, *, args: str):
     !match Arsenal vs Chelsea
     !match Arsenal vs Chelsea | odds: 2.10, 3.40, 3.20
     """
-    await ctx.trigger_typing()
+    async with ctx.typing():
+        match_query = args
+        oh = od = oa = None
 
-    match_query = args
-    oh = od = oa = None
+        if "|" in args:
+            parts = args.split("|")
+            match_query = parts[0].strip()
+            odds_str = parts[1].replace("odds:", "").strip()
+            try:
+                vals = [float(x.strip()) for x in odds_str.split(",")]
+                if len(vals) == 3:
+                    oh, od, oa = vals
+                elif len(vals) == 2:
+                    oh, oa = vals
+            except ValueError:
+                await ctx.send("bad odds format. use: !match Team A vs Team B | odds: 2.10, 3.40, 3.20")
+                return
 
-    if "|" in args:
-        parts = args.split("|")
-        match_query = parts[0].strip()
-        odds_str = parts[1].replace("odds:", "").strip()
+        gid = ctx.guild.id if ctx.guild else ctx.author.id
+        min_edge = get_min_edge(gid)
+
         try:
-            vals = [float(x.strip()) for x in odds_str.split(",")]
-            if len(vals) == 3:
-                oh, od, oa = vals
-            elif len(vals) == 2:
-                oh, oa = vals
-        except ValueError:
-            await ctx.send("bad odds format. use: !match Team A vs Team B | odds: 2.10, 3.40, 3.20")
+            data = await fetch_true_probabilities(match_query)
+        except Exception as e:
+            await ctx.send(f"error: {e}")
             return
 
-    gid = ctx.guild.id if ctx.guild else ctx.author.id
-    min_edge = get_min_edge(gid)
+        tp  = data["true_probabilities"]
+        mf  = data["matrix_factors"]
+        fc  = data.get("forecast", "N/A")
+        src = "Surplus API" if os.getenv("SURPLUS_API_URL") else f"OpenAI ({OPENAI_MODEL})"
 
-    try:
-        data = await fetch_true_probabilities(match_query)
-    except Exception as e:
-        await ctx.send(f"error: {e}")
-        return
+        embed = discord.Embed(
+            title=f"Matrix: {data.get('match_name', match_query)}",
+            color=discord.Color.blue()
+        )
 
-    tp  = data["true_probabilities"]
-    mf  = data["matrix_factors"]
-    fc  = data.get("forecast", "N/A")
-    src = "Surplus API" if os.getenv("SURPLUS_API_URL") else f"OpenAI ({OPENAI_MODEL})"
+        embed.add_field(
+            name="True Probabilities (no odds bias)",
+            value=(
+                f"**{data.get('home_team','Home')}**: {tp['home_win']*100:.1f}%\n"
+                f"**Draw**: {tp.get('draw',0)*100:.1f}%\n"
+                f"**{data.get('away_team','Away')}**: {tp['away_win']*100:.1f}%"
+            ),
+            inline=False
+        )
+        embed.add_field(name="Forecast", value=fc, inline=False)
 
-    embed = discord.Embed(
-        title=f"Matrix: {data.get('match_name', match_query)}",
-        color=discord.Color.blue()
-    )
-
-    embed.add_field(
-        name="True Probabilities (no odds bias)",
-        value=(
-            f"**{data.get('home_team','Home')}**: {tp['home_win']*100:.1f}%\n"
-            f"**Draw**: {tp.get('draw',0)*100:.1f}%\n"
-            f"**{data.get('away_team','Away')}**: {tp['away_win']*100:.1f}%"
-        ),
-        inline=False
-    )
-    embed.add_field(name="Forecast", value=fc, inline=False)
-
-    factor_lines = [
-        f"Home form: {mf.get('home_form','?')}",
-        f"Away form: {mf.get('away_form','?')}",
-        f"Home absences: {mf.get('home_absences','none')}",
-        f"Away absences: {mf.get('away_absences','none')}",
-        f"Tactical edge: {mf.get('tactical_edge','none')}"
-    ]
-    embed.add_field(name="Factors", value="\n".join(factor_lines), inline=False)
-
-    if oh and oa:
-        calc = calculate_edges(tp, oh, od, oa)
-        edges   = calc["edges"]
-        implied = calc["implied"]
-
-        edge_lines = [
-            f"Home implied: {implied['home']*100:.1f}%  |  edge: {edges['home']*100:+.1f}%"
+        factor_lines = [
+            f"Home form: {mf.get('home_form','?')}",
+            f"Away form: {mf.get('away_form','?')}",
+            f"Home absences: {mf.get('home_absences','none')}",
+            f"Away absences: {mf.get('away_absences','none')}",
+            f"Tactical edge: {mf.get('tactical_edge','none')}"
         ]
-        if od:
-            edge_lines.append(f"Draw implied: {implied['draw']*100:.1f}%  |  edge: {edges['draw']*100:+.1f}%")
-        edge_lines.append(f"Away implied: {implied['away']*100:.1f}%  |  edge: {edges['away']*100:+.1f}%")
+        embed.add_field(name="Factors", value="\n".join(factor_lines), inline=False)
 
-        embed.add_field(name="Market Edge", value="\n".join(edge_lines), inline=False)
+        if oh and oa:
+            calc = calculate_edges(tp, oh, od, oa)
+            edges   = calc["edges"]
+            implied = calc["implied"]
 
-        # value bets
-        bets = []
-        if edges["home"] >= min_edge:
-            bets.append(f"Home ({data.get('home_team')}): {edges['home']*100:+.1f}%")
-        if od and edges.get("draw") and edges["draw"] >= min_edge:
-            bets.append(f"Draw: {edges['draw']*100:+.1f}%")
-        if edges["away"] >= min_edge:
-            bets.append(f"Away ({data.get('away_team')}): {edges['away']*100:+.1f}%")
+            edge_lines = [
+                f"Home implied: {implied['home']*100:.1f}%  |  edge: {edges['home']*100:+.1f}%"
+            ]
+            if od:
+                edge_lines.append(f"Draw implied: {implied['draw']*100:.1f}%  |  edge: {edges['draw']*100:+.1f}%")
+            edge_lines.append(f"Away implied: {implied['away']*100:.1f}%  |  edge: {edges['away']*100:+.1f}%")
 
-        if bets:
-            embed.add_field(
-                name=f"VALUE (min edge ≥ {min_edge*100:.1f}%)",
-                value="\n".join(f"✅ {b}" for b in bets),
-                inline=False
-            )
-        else:
-            embed.add_field(
-                name=f"No value (threshold {min_edge*100:.1f}%)",
-                value="Pass — no edge exceeds threshold.",
-                inline=False
-            )
+            embed.add_field(name="Market Edge", value="\n".join(edge_lines), inline=False)
 
-    embed.set_footer(text=f"Engine: {src}  |  min edge: {min_edge*100:.1f}%  |  confidence: {data.get('confidence','?')}")
-    await ctx.send(embed=embed)
+            # value bets
+            bets = []
+            if edges["home"] >= min_edge:
+                bets.append(f"Home ({data.get('home_team')}): {edges['home']*100:+.1f}%")
+            if od and edges.get("draw") and edges["draw"] >= min_edge:
+                bets.append(f"Draw: {edges['draw']*100:+.1f}%")
+            if edges["away"] >= min_edge:
+                bets.append(f"Away ({data.get('away_team')}): {edges['away']*100:+.1f}%")
+
+            if bets:
+                embed.add_field(
+                    name=f"VALUE (min edge ≥ {min_edge*100:.1f}%)",
+                    value="\n".join(f"✅ {b}" for b in bets),
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name=f"No value (threshold {min_edge*100:.1f}%)",
+                    value="Pass — no edge exceeds threshold.",
+                    inline=False
+                )
+
+        embed.set_footer(text=f"Engine: {src}  |  min edge: {min_edge*100:.1f}%  |  confidence: {data.get('confidence','?')}")
+        await ctx.send(embed=embed)
 
 @bot.event
 async def on_ready():
