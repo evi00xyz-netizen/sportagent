@@ -6,6 +6,7 @@ import sys
 import traceback
 import asyncio
 import signal
+import subprocess
 import discord
 from discord.ext import commands
 from openai import AsyncOpenAI, APIStatusError
@@ -39,6 +40,72 @@ def set_min_edge(guild_id: int, edge: float):
     if guild_id not in user_settings:
         user_settings[guild_id] = {}
     user_settings[guild_id]["min_edge"] = edge
+
+# ── bullpen CLI wrapper & watcher state ─────────────────────
+bullpen_watch_state = {
+    "active": False,
+    "channel_id": None,
+    "address": None,
+    "source": None,
+    "stop_loss": None,
+    "interval": 60,
+    "task": None
+}
+
+def run_bullpen_positions(address: str = None, source: str = None) -> str:
+    """Executes the `bullpen polymarket positions` CLI command."""
+    cmd = ["bullpen", "polymarket", "positions"]
+    if address:
+        cmd.extend(["--address", address])
+    if source:
+        cmd.extend(["--source", source])
+    
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return res.stdout.strip()
+    except FileNotFoundError:
+        return "[Error] `bullpen` CLI tool is not installed or not in PATH on this server."
+    except subprocess.CalledProcessError as e:
+        err_msg = e.stderr.strip() or e.stdout.strip()
+        return f"[Bullpen Error] {err_msg}"
+
+async def bullpen_watcher_loop():
+    """Background task constantly polling bullpen positions and checking Stop Loss / changes."""
+    while True:
+        try:
+            if bullpen_watch_state["active"] and bullpen_watch_state["channel_id"]:
+                channel = bot.get_channel(bullpen_watch_state["channel_id"])
+                if channel:
+                    addr = bullpen_watch_state["address"]
+                    src = bullpen_watch_state["source"]
+                    sl = bullpen_watch_state["stop_loss"]
+
+                    pos_output = await asyncio.to_thread(run_bullpen_positions, addr, src)
+                    
+                    sl_triggered = False
+                    if sl is not None:
+                        # Scan output for numeric percentage loss metrics if available
+                        matches = re.findall(r"-\d+(?:\.\d+)?%", pos_output)
+                        for m in matches:
+                            loss_val = abs(float(m.replace("%", "")))
+                            if loss_val >= sl:
+                                sl_triggered = True
+                                break
+
+                    if sl_triggered:
+                        embed = discord.Embed(
+                            title="🚨 BULLPEN STOP LOSS TRIGGERED",
+                            description=f"Stop Loss threshold of `{sl}%` reached/exceeded!",
+                            color=discord.Color.red()
+                        )
+                        embed.add_field(name="Current Positions", value=_trunc(f"```\n{pos_output}\n```"), inline=False)
+                        await channel.send(embed=embed)
+
+        except Exception as e:
+            print(f"[Bullpen Watcher Error] {e}", file=sys.stderr)
+
+        interval = bullpen_watch_state.get("interval", 60)
+        await asyncio.sleep(interval)
 
 # ── sport detection ─────────────────────────────────────────
 NO_DRAW_SPORTS = {"mlb", "nba", "nfl", "nhl", "baseball", "basketball", "football", "hockey",
@@ -299,6 +366,106 @@ def calculate_edges(true_probs: dict, odds_home: float = None, odds_draw: float 
 
 # ── discord commands ────────────────────────────────────────
 
+@bot.command(name="positions")
+async def cmd_positions(ctx, *, args: str = ""):
+    """Check Polymarket positions using bullpen CLI.
+    Usage:
+      !positions
+      !positions --address 0x123...
+      !positions --source bullpen
+      !positions --source polymarket
+    """
+    async with ctx.typing():
+        addr = None
+        src = None
+        if "--address" in args:
+            m = re.search(r"--address\s+([^\s]+)", args)
+            if m:
+                addr = m.group(1)
+        if "--source" in args:
+            m = re.search(r"--source\s+([^\s]+)", args)
+            if m:
+                src = m.group(1)
+
+        output = await asyncio.to_thread(run_bullpen_positions, addr, src)
+        
+        embed = discord.Embed(
+            title="Bullpen Polymarket Positions",
+            description=f"```\n{_trunc(output, 2000)}\n```",
+            color=discord.Color.gold()
+        )
+        if addr:
+            embed.add_field(name="Address", value=addr, inline=True)
+        if src:
+            embed.add_field(name="Source", value=src, inline=True)
+        await ctx.send(embed=embed)
+
+@bot.command(name="watchbullpen")
+async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
+    """Start/stop watching bullpen positions with optional stop-loss trigger.
+    Usage:
+      !watchbullpen start [--address 0x...] [--source bullpen|polymarket] [--sl 15] [--interval 60]
+      !watchbullpen stop
+      !watchbullpen status
+    """
+    global bullpen_watch_state
+    act = action.lower()
+
+    if act == "stop":
+        bullpen_watch_state["active"] = False
+        await ctx.send("🛑 Stopped watching Bullpen positions.")
+        return
+
+    if act == "status":
+        status_str = (
+            f"**Status:** {'🟢 Active' if bullpen_watch_state['active'] else '🔴 Stopped'}\n"
+            f"**Channel:** <#{bullpen_watch_state['channel_id']}>\n"
+            f"**Address:** `{bullpen_watch_state['address'] or 'Default'}`\n"
+            f"**Source:** `{bullpen_watch_state['source'] or 'Default'}`\n"
+            f"**Stop Loss:** `{f'{bullpen_watch_state[\"stop_loss\"]}%' if bullpen_watch_state['stop_loss'] else 'None'}`\n"
+            f"**Interval:** `{bullpen_watch_state['interval']}s`"
+        )
+        await ctx.send(embed=discord.Embed(title="Bullpen Watcher Status", description=status_str, color=discord.Color.blue()))
+        return
+
+    if act == "start":
+        addr = None
+        src = None
+        sl = None
+        interval = 60
+
+        if "--address" in args:
+            m = re.search(r"--address\s+([^\s]+)", args)
+            if m: addr = m.group(1)
+        if "--source" in args:
+            m = re.search(r"--source\s+([^\s]+)", args)
+            if m: src = m.group(1)
+        if "--sl" in args:
+            m = re.search(r"--sl\s+(\d+(?:\.\d+)?)", args)
+            if m: sl = float(m.group(1))
+        if "--interval" in args:
+            m = re.search(r"--interval\s+(\d+)", args)
+            if m: interval = int(m.group(1))
+
+        bullpen_watch_state["active"] = True
+        bullpen_watch_state["channel_id"] = ctx.channel.id
+        bullpen_watch_state["address"] = addr
+        bullpen_watch_state["source"] = src
+        bullpen_watch_state["stop_loss"] = sl
+        bullpen_watch_state["interval"] = interval
+
+        msg = (
+            f"🟢 **Started watching Bullpen positions in this channel!**\n"
+            f"• Interval: `{interval}s`\n"
+            f"• Address: `{addr or 'Default'}`\n"
+            f"• Source: `{src or 'Default'}`\n"
+            f"• Stop Loss Trigger: `{f'{sl}%' if sl else 'Disabled'}`"
+        )
+        await ctx.send(msg)
+        return
+
+    await ctx.send("Usage: `!watchbullpen start|stop|status [options]`")
+
 @bot.command(name="minedge")
 async def cmd_set_min_edge(ctx, edge_pct: float):
     gid = ctx.guild.id if ctx.guild else ctx.author.id
@@ -445,6 +612,8 @@ async def on_command_error(ctx, error):
 async def on_ready():
     print(f"online: {bot.user.name} ({bot.user.id})")
     print(f"model: {SURPLUS_MODEL}  |  base_url: {SURPLUS_BASE_URL}")
+    if bullpen_watch_state["task"] is None:
+        bullpen_watch_state["task"] = asyncio.create_task(bullpen_watcher_loop())
 
 @bot.event
 async def on_disconnect():
