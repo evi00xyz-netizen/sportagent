@@ -54,6 +54,7 @@ def load_watcher_config() -> dict:
         "address": None,
         "source": None,
         "stop_loss": None,
+        "auto_close_sl": True,
         "interval": 2,
         "periodic_interval": 300,
         "sl_alert_fired": False,
@@ -78,6 +79,7 @@ def save_watcher_config(state: dict):
             "address": state.get("address"),
             "source": state.get("source"),
             "stop_loss": state.get("stop_loss"),
+            "auto_close_sl": state.get("auto_close_sl", True),
             "interval": state.get("interval", 2),
             "periodic_interval": state.get("periodic_interval", 300),
             "sl_alert_fired": state.get("sl_alert_fired", False),
@@ -143,8 +145,26 @@ def run_bullpen_positions(address: str = None, source: str = None) -> str:
     except Exception as e:
         return f"[Error] Failed to execute bullpen CLI: {e}"
 
-def parse_positions_to_cards(raw_output: str) -> tuple[str, list[str]]:
-    """Parses wide CLI table output into header text and individual mobile card strings."""
+def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
+    """Executes `bullpen polymarket sell <slug> <outcome> <shares>` to close position."""
+    bin_path = get_bullpen_binary_path()
+    cmd_parts = [bin_path, "polymarket", "sell", market_slug, outcome, str(shares)]
+
+    env = os.environ.copy()
+    bullpen_bin_dir = os.path.expanduser("~/.bullpen/bin")
+    if os.path.exists(bullpen_bin_dir):
+        env["PATH"] = f"{bullpen_bin_dir}:{env.get('PATH', '')}"
+
+    try:
+        res = subprocess.run(cmd_parts, capture_output=True, text=True, check=True, timeout=15, env=env)
+        return res.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return "[Error] `bullpen polymarket sell` command timed out."
+    except Exception as e:
+        return f"[Sell Error] Failed to sell position: {e}"
+
+def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
+    """Parses wide CLI table output into header text and individual position objects."""
     if not raw_output or raw_output.startswith("[Error]") or raw_output.startswith("[Bullpen Error]"):
         return f"```\n{raw_output}\n```", []
 
@@ -173,7 +193,7 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[str]]:
     if source_line:
         header += f"• _{source_line}_\n"
 
-    cards = []
+    parsed_positions = []
     if position_lines:
         for pos in position_lines:
             tokens = pos.split()
@@ -188,25 +208,35 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[str]]:
                 outcome = tokens[-8]
                 market = " ".join(tokens[:-8])
 
-                pnl_emoji = "🔴" if "-" in pnl or "-" in roe else "🟢"
+                parsed_positions.append({
+                    "raw": pos,
+                    "market": market,
+                    "outcome": outcome,
+                    "status": status,
+                    "shares": shares,
+                    "entry": entry,
+                    "now": now,
+                    "value": val,
+                    "pnl": pnl,
+                    "roe": roe
+                })
+    return header, parsed_positions
 
-                card = (
-                    f"📌 **{market}**\n"
-                    f"• Outcome: **{outcome}** | Status: `{status}`\n"
-                    f"• Shares: `{shares}` | Value: `{val}`\n"
-                    f"• Entry: `{entry}` ➔ Now: `{now}`\n"
-                    f"• P&L: {pnl_emoji} `{pnl}` (`{roe}`)"
-                )
-                cards.append(card)
-            else:
-                cards.append(f"`{pos}`")
-    return header, cards
+def format_card_from_obj(p: dict) -> str:
+    pnl_emoji = "🔴" if "-" in p["pnl"] or "-" in p["roe"] else "🟢"
+    return (
+        f"📌 **{p['market']}**\n"
+        f"• Outcome: **{p['outcome']}** | Status: `{p['status']}`\n"
+        f"• Shares: `{p['shares']}` | Value: `{p['value']}`\n"
+        f"• Entry: `{p['entry']}` ➔ Now: `{p['now']}`\n"
+        f"• P&L: {pnl_emoji} `{p['pnl']}` (`{p['roe']}`)"
+    )
 
 async def send_positions_embeds(target, title: str, raw_output: str, addr: str = None, src: str = None):
     """Sends positions as nicely chunked mobile cards across fields/embeds so no trades are cut off."""
-    header, cards = parse_positions_to_cards(raw_output)
+    header, pos_objs = parse_positions_to_cards(raw_output)
 
-    if not cards:
+    if not pos_objs:
         embed = discord.Embed(
             title=title,
             description=header or f"```\n{_trunc(raw_output, 2000)}\n```",
@@ -216,6 +246,8 @@ async def send_positions_embeds(target, title: str, raw_output: str, addr: str =
         if src: embed.add_field(name="Source", value=src, inline=True)
         await target.send(embed=embed)
         return
+
+    cards = [format_card_from_obj(p) for p in pos_objs]
 
     # Build chunked embeds to stay strictly within Discord limits
     embeds_to_send = []
@@ -245,7 +277,7 @@ async def send_positions_embeds(target, title: str, raw_output: str, addr: str =
             current_field_content = ""
             current_field_count = 0
 
-        # Check if embed is full (field count >= 20 or chars > 5000)
+        # Check if embed is full (field count >= 15 or chars > 5000)
         if len(current_embed.fields) >= 15 or current_char_count > EMBED_TOTAL_MAX:
             embeds_to_send.append(current_embed)
             current_embed = discord.Embed(
@@ -283,6 +315,7 @@ async def bullpen_watcher_loop():
                     addr = bullpen_watch_state.get("address")
                     src = bullpen_watch_state.get("source")
                     sl = bullpen_watch_state.get("stop_loss")
+                    auto_close = bullpen_watch_state.get("auto_close_sl", True)
                     periodic_interval = bullpen_watch_state.get("periodic_interval", 300)
 
                     pos_output = await asyncio.to_thread(run_bullpen_positions, addr, src)
@@ -291,26 +324,71 @@ async def bullpen_watcher_loop():
                         print(f"[Bullpen Watcher CLI Warning] {pos_output}", file=sys.stderr)
                     else:
                         now = time.time()
+                        header, pos_objs = parse_positions_to_cards(pos_output)
 
-                        # Stop loss check
-                        sl_triggered = False
+                        # Check each position against stop loss threshold
+                        triggered_positions = []
                         if sl is not None:
-                            matches = re.findall(r"-\d+(?:\.\d+)?%", pos_output)
-                            for m in matches:
-                                loss_val = abs(float(m.replace("%", "")))
-                                if loss_val >= sl:
-                                    sl_triggered = True
-                                    break
+                            for p in pos_objs:
+                                roe_str = p.get("roe", "")
+                                if "-" in roe_str:
+                                    try:
+                                        loss_val = abs(float(roe_str.replace("%", "").replace("-", "")))
+                                        if loss_val >= sl:
+                                            triggered_positions.append(p)
+                                    except ValueError:
+                                        pass
 
-                        if sl_triggered:
+                        if triggered_positions:
                             if not bullpen_watch_state.get("sl_alert_fired", False):
-                                await send_positions_embeds(
-                                    channel,
-                                    f"🚨 BULLPEN STOP LOSS TRIGGERED ({sl}%)",
-                                    pos_output,
-                                    addr,
-                                    src
+                                embed = discord.Embed(
+                                    title=f"🚨 BULLPEN STOP LOSS TRIGGERED ({sl}%)",
+                                    description=f"Found **{len(triggered_positions)}** position(s) exceeding Stop Loss threshold of `{sl}%`!",
+                                    color=discord.Color.red()
                                 )
+                                for tp in triggered_positions:
+                                    embed.add_field(
+                                        name=f"⚠️ BREACHED: {tp['market']}",
+                                        value=f"Outcome: **{tp['outcome']}** | Shares: `{tp['shares']}`\nLoss: `{tp['pnl']}` (`{tp['roe']}`)",
+                                        inline=False
+                                    )
+                                await channel.send(embed=embed)
+
+                                # Auto-close breached trades if enabled
+                                if auto_close:
+                                    for tp in triggered_positions:
+                                        market_slug = tp['market'].lower().replace(" ", "-")
+                                        market_slug = re.sub(r'[^a-z0-9\-]', '', market_slug)
+
+                                        close_embed = discord.Embed(
+                                            title=f"⚡ AUTO-CLOSING POSITION",
+                                            description=f"Executing market sell for **{tp['market']}**...",
+                                            color=discord.Color.orange()
+                                        )
+                                        await channel.send(embed=close_embed)
+
+                                        try:
+                                            shares_num = float(tp['shares'])
+                                            sell_res = await asyncio.to_thread(
+                                                execute_bullpen_sell,
+                                                market_slug,
+                                                tp['outcome'],
+                                                shares_num
+                                            )
+                                            res_embed = discord.Embed(
+                                                title="✅ POSITION CLOSED",
+                                                description=f"```\n{_trunc(sell_res, 2000)}\n```",
+                                                color=discord.Color.green()
+                                            )
+                                            await channel.send(embed=res_embed)
+                                        except Exception as se:
+                                            err_embed = discord.Embed(
+                                                title="❌ AUTO-CLOSE FAILED",
+                                                description=f"Failed to sell `{tp['market']}`: {se}",
+                                                color=discord.Color.dark_red()
+                                            )
+                                            await channel.send(embed=err_embed)
+
                                 bullpen_watch_state["sl_alert_fired"] = True
                                 save_watcher_config(bullpen_watch_state)
                         else:
@@ -643,12 +721,14 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         is_active = "🟢 Active (24/7 Monitoring)" if bullpen_watch_state.get("active") else "🔴 Stopped"
         sl_val = bullpen_watch_state.get("stop_loss")
         sl_str = f"{sl_val}%" if sl_val is not None else "None"
+        auto_close_str = "🟢 Enabled (Auto-Sell)" if bullpen_watch_state.get("auto_close_sl", True) else "🔴 Disabled (Alert Only)"
         status_str = (
             f"**Status:** {is_active}\n"
             f"**Channel:** <#{target_ch}>\n"
             f"**Address:** `{bullpen_watch_state.get('address') or 'Default'}`\n"
             f"**Source:** `{bullpen_watch_state.get('source') or 'Default'}`\n"
             f"**Stop Loss:** `{sl_str}`\n"
+            f"**Auto Close Trade:** {auto_close_str}\n"
             f"**Interval:** `{bullpen_watch_state.get('interval', 2)}s`\n"
             f"**Periodic Report:** Every 5 min"
         )
@@ -686,6 +766,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         bullpen_watch_state["address"] = addr
         bullpen_watch_state["source"] = src
         bullpen_watch_state["stop_loss"] = sl
+        bullpen_watch_state["auto_close_sl"] = True
         bullpen_watch_state["interval"] = max(1, interval)
         bullpen_watch_state["sl_alert_fired"] = False
 
@@ -696,8 +777,9 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
             f"🟢 **Started 24/7 background watching of Bullpen positions!**\n"
             f"• Target Channel: <#{target_ch}>\n"
             f"• Monitoring Interval: `{interval}s` (SL check)\n"
+            f"• Stop Loss Trigger: `{sl_desc}`\n"
+            f"• Auto-Close Action: ⚡ `bullpen polymarket sell` (Executes automatically when SL breaches)\n"
             f"• Periodic Report: Every 5 minutes\n"
-            f"• Stop Loss Trigger: `{sl_desc}` (fires once when triggered)\n"
             f"• Quick fetch: Type `open` or `!open` anytime to push current positions up."
         )
         await ctx.send(msg)
