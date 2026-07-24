@@ -3,6 +3,7 @@ import json
 import re
 import ast
 import sys
+import time
 import traceback
 import asyncio
 import signal
@@ -53,7 +54,7 @@ def load_watcher_config() -> dict:
         "source": None,
         "stop_loss": None,
         "interval": 2,
-        "notify_on_change": False,
+        "periodic_interval": 300,
         "sl_alert_fired": False,
         "last_positions": None
     }
@@ -77,7 +78,7 @@ def save_watcher_config(state: dict):
             "source": state.get("source"),
             "stop_loss": state.get("stop_loss"),
             "interval": state.get("interval", 2),
-            "notify_on_change": state.get("notify_on_change", False),
+            "periodic_interval": state.get("periodic_interval", 300),
             "sl_alert_fired": state.get("sl_alert_fired", False),
             "last_positions": state.get("last_positions")
         }
@@ -88,6 +89,7 @@ def save_watcher_config(state: dict):
 
 bullpen_watch_state = load_watcher_config()
 bullpen_watch_state["task"] = None
+last_periodic_time = 0
 
 def get_bullpen_binary_path() -> str:
     """Finds the absolute path to the valid bullpen executable."""
@@ -122,7 +124,6 @@ def run_bullpen_positions(address: str = None, source: str = None) -> str:
     if source:
         cmd_parts.extend(["--source", source])
 
-    # Ensure PATH includes ~/.bullpen/bin at the front
     env = os.environ.copy()
     bullpen_bin_dir = os.path.expanduser("~/.bullpen/bin")
     if os.path.exists(bullpen_bin_dir):
@@ -143,6 +144,7 @@ def run_bullpen_positions(address: str = None, source: str = None) -> str:
 
 async def bullpen_watcher_loop():
     """Background task continuously monitoring bullpen positions 24/7 across restarts."""
+    global last_periodic_time
     while True:
         try:
             if bullpen_watch_state["active"]:
@@ -152,13 +154,15 @@ async def bullpen_watcher_loop():
                     addr = bullpen_watch_state.get("address")
                     src = bullpen_watch_state.get("source")
                     sl = bullpen_watch_state.get("stop_loss")
-                    last_pos = bullpen_watch_state.get("last_positions")
+                    periodic_interval = bullpen_watch_state.get("periodic_interval", 300)
 
                     pos_output = await asyncio.to_thread(run_bullpen_positions, addr, src)
 
                     if pos_output.startswith("[Error]") or pos_output.startswith("[Bullpen Error]"):
                         print(f"[Bullpen Watcher CLI Warning] {pos_output}", file=sys.stderr)
                     else:
+                        now = time.time()
+
                         # Stop loss check
                         sl_triggered = False
                         if sl is not None:
@@ -170,7 +174,6 @@ async def bullpen_watcher_loop():
                                     break
 
                         if sl_triggered:
-                            # Send SL trigger notification ONLY ONCE per trigger event
                             if not bullpen_watch_state.get("sl_alert_fired", False):
                                 embed = discord.Embed(
                                     title="🚨 BULLPEN STOP LOSS TRIGGERED",
@@ -182,13 +185,21 @@ async def bullpen_watcher_loop():
                                 bullpen_watch_state["sl_alert_fired"] = True
                                 save_watcher_config(bullpen_watch_state)
                         else:
-                            # Reset SL alert trigger state if loss recovers or condition resolves
                             if bullpen_watch_state.get("sl_alert_fired", False):
                                 bullpen_watch_state["sl_alert_fired"] = False
                                 save_watcher_config(bullpen_watch_state)
 
-                        # Silently track position changes without sending messages
-                        if pos_output != last_pos:
+                        # Periodic 5-minute position report update
+                        if last_periodic_time == 0 or (now - last_periodic_time) >= periodic_interval:
+                            embed = discord.Embed(
+                                title="📊 Bullpen 5-Min Position Report",
+                                description=f"```\n{_trunc(pos_output, 2000)}\n```",
+                                color=discord.Color.blue()
+                            )
+                            await channel.send(embed=embed)
+                            last_periodic_time = now
+
+                        if pos_output != bullpen_watch_state.get("last_positions"):
                             bullpen_watch_state["last_positions"] = pos_output
                             save_watcher_config(bullpen_watch_state)
 
@@ -457,14 +468,13 @@ def calculate_edges(true_probs: dict, odds_home: float = None, odds_draw: float 
 
 # ── discord commands ────────────────────────────────────────
 
-@bot.command(name="positions")
-async def cmd_positions(ctx, *, args: str = ""):
-    """Check Polymarket positions using bullpen CLI.
+@bot.command(name="open", aliases=["positions", "p"])
+async def cmd_open(ctx, *, args: str = ""):
+    """Check Polymarket positions using bullpen CLI immediately.
     Usage:
-      !positions
-      !positions --address 0x123...
-      !positions --source bullpen
-      !positions --source polymarket
+      open / !open / !positions
+      open --address 0x123...
+      open --source bullpen
     """
     async with ctx.typing():
         addr = None
@@ -519,7 +529,8 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
             f"**Address:** `{bullpen_watch_state.get('address') or 'Default'}`\n"
             f"**Source:** `{bullpen_watch_state.get('source') or 'Default'}`\n"
             f"**Stop Loss:** `{sl_str}`\n"
-            f"**Interval:** `{bullpen_watch_state.get('interval', 2)}s`"
+            f"**Interval:** `{bullpen_watch_state.get('interval', 2)}s`\n"
+            f"**Periodic Report:** Every 5 min"
         )
         await ctx.send(embed=discord.Embed(title="Bullpen Watcher Status", description=status_str, color=discord.Color.blue()))
         return
@@ -564,11 +575,10 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         msg = (
             f"🟢 **Started 24/7 background watching of Bullpen positions!**\n"
             f"• Target Channel: <#{target_ch}>\n"
-            f"• Interval: `{interval}s`\n"
-            f"• Address: `{addr or 'Default'}`\n"
-            f"• Source: `{src or 'Default'}`\n"
+            f"• Monitoring Interval: `{interval}s` (SL check)\n"
+            f"• Periodic Report: Every 5 minutes\n"
             f"• Stop Loss Trigger: `{sl_desc}` (fires once when triggered)\n"
-            f"• Silent monitoring mode active — position cards are only shown when explicitly requested (`!positions`)."
+            f"• Quick fetch: Type `open` or `!open` anytime to push current positions up."
         )
         await ctx.send(msg)
         return
@@ -692,6 +702,19 @@ async def cmd_match(ctx, *, args: str):
 
         embed.set_footer(text=f"Engine: {src}  |  min edge: {min_edge*100:.1f}%  |  confidence: {data.get('confidence','?')}")
         await ctx.send(embed=embed)
+
+# ── event listeners ─────────────────────────────────────────
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    content_lower = message.content.strip().lower()
+    if content_lower in ("open", "positions"):
+        ctx = await bot.get_context(message)
+        await cmd_open(ctx)
+        return
+    await bot.process_commands(message)
 
 # ── global error handler ────────────────────────────────────
 
