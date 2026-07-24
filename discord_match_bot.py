@@ -7,6 +7,7 @@ import traceback
 import asyncio
 import signal
 import subprocess
+import shutil
 import discord
 from discord.ext import commands
 from openai import AsyncOpenAI, APIStatusError
@@ -86,26 +87,51 @@ def save_watcher_config(state: dict):
 bullpen_watch_state = load_watcher_config()
 bullpen_watch_state["task"] = None
 
+def get_bullpen_binary_path() -> str:
+    """Finds the absolute path to the bullpen executable."""
+    candidate = shutil.which("bullpen")
+    if candidate:
+        return candidate
+    common_paths = [
+        "/root/.bullpen/bin/bullpen",
+        os.path.expanduser("~/.bullpen/bin/bullpen"),
+        "/usr/local/bin/bullpen",
+        "/usr/bin/bullpen"
+    ]
+    for p in common_paths:
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+    return "bullpen"
+
 def run_bullpen_positions(address: str = None, source: str = None) -> str:
-    """Executes the `bullpen polymarket positions` CLI command with timeout and shell fallback."""
-    cmd = ["bullpen", "polymarket", "positions"]
+    """Executes the `bullpen polymarket positions` CLI command with timeout."""
+    bin_path = get_bullpen_binary_path()
+    cmd = [bin_path, "polymarket", "positions"]
     if address:
         cmd.extend(["--address", address])
     if source:
         cmd.extend(["--source", source])
     
+    # Ensure PATH includes ~/.bullpen/bin
+    env = os.environ.copy()
+    bullpen_bin_dir = os.path.expanduser("~/.bullpen/bin")
+    if os.path.exists(bullpen_bin_dir) and bullpen_bin_dir not in env.get("PATH", ""):
+        env["PATH"] = f"{bullpen_bin_dir}:{env.get('PATH', '')}"
+
     try:
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
-        except OSError:
-            # Fallback to shell execution if binary format / missing shebang issues occur (e.g. Errno 8)
-            cmd_str = " ".join(cmd)
-            res = subprocess.run(cmd_str, capture_output=True, text=True, check=True, timeout=10, shell=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10, env=env)
         return res.stdout.strip()
     except subprocess.TimeoutExpired:
         return "[Error] `bullpen` CLI command timed out after 10 seconds."
     except FileNotFoundError:
         return "[Error] `bullpen` CLI tool is not installed or not in PATH on this server."
+    except OSError as e:
+        if e.errno == 8: # Exec format error
+            return (
+                "[Error] Exec format error: `bullpen` binary architecture does not match server CPU architecture "
+                "(e.g. x86_64 binary installed on an ARM64 server or vice versa). Please check `uname -m`."
+            )
+        return f"[Error] OS Error executing `bullpen`: {e}"
     except subprocess.CalledProcessError as e:
         err_msg = e.stderr.strip() or e.stdout.strip()
         return f"[Bullpen Error] {err_msg}"
