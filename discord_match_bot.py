@@ -87,7 +87,7 @@ bullpen_watch_state = load_watcher_config()
 bullpen_watch_state["task"] = None
 
 def run_bullpen_positions(address: str = None, source: str = None) -> str:
-    """Executes the `bullpen polymarket positions` CLI command with timeout."""
+    """Executes the `bullpen polymarket positions` CLI command with timeout and shell fallback."""
     cmd = ["bullpen", "polymarket", "positions"]
     if address:
         cmd.extend(["--address", address])
@@ -95,7 +95,12 @@ def run_bullpen_positions(address: str = None, source: str = None) -> str:
         cmd.extend(["--source", source])
     
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
+        except OSError:
+            # Fallback to shell execution if binary format / missing shebang issues occur (e.g. Errno 8)
+            cmd_str = " ".join(cmd)
+            res = subprocess.run(cmd_str, capture_output=True, text=True, check=True, timeout=10, shell=True)
         return res.stdout.strip()
     except subprocess.TimeoutExpired:
         return "[Error] `bullpen` CLI command timed out after 10 seconds."
@@ -104,6 +109,8 @@ def run_bullpen_positions(address: str = None, source: str = None) -> str:
     except subprocess.CalledProcessError as e:
         err_msg = e.stderr.strip() or e.stdout.strip()
         return f"[Bullpen Error] {err_msg}"
+    except Exception as e:
+        return f"[Error] Failed to execute bullpen CLI: {e}"
 
 async def bullpen_watcher_loop():
     """Background task continuously monitoring bullpen positions 24/7 across restarts."""
