@@ -7,12 +7,9 @@ from openai import AsyncOpenAI
 
 # ── env config ──────────────────────────────────────────────
 DEFAULT_MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
-
-# model routing: set LLM_PROVIDER to "surplus" or "openai" (default: surplus if SURPLUS_API_KEY is set)
-LLM_PROVIDER  = os.getenv("LLM_PROVIDER", "surplus" if os.getenv("SURPLUS_API_KEY") else "openai")
-LLM_MODEL     = os.getenv("LLM_MODEL", "glm-5.2" if LLM_PROVIDER == "surplus" else "gpt-4o")
-LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "https://api.surplusintelligence.ai/min30/v1" if LLM_PROVIDER == "surplus" else None)
-LLM_API_KEY   = os.getenv("LLM_API_KEY") or os.getenv("SURPLUS_API_KEY") or os.getenv("OPENAI_API_KEY")
+SURPLUS_API_KEY  = os.getenv("SURPLUS_API_KEY")
+SURPLUS_BASE_URL = os.getenv("SURPLUS_API_URL", "https://api.surplusintelligence.ai/min30/v1")
+SURPLUS_MODEL    = os.getenv("SURPLUS_MODEL", "glm-5.2")
 
 # ── discord setup ───────────────────────────────────────────
 intents = discord.Intents.default()
@@ -72,7 +69,6 @@ def extract_json(raw: str) -> str:
     if not raw:
         raise ValueError("empty response from llm")
 
-    # strip all leading/trailing whitespace including newlines
     raw = raw.strip()
 
     # try markdown code block: ```json ... ``` or ``` ... ```
@@ -132,31 +128,22 @@ def parse_llm_response(raw: str) -> dict:
 
 # ── api client ──────────────────────────────────────────────
 
-def get_llm_client() -> AsyncOpenAI:
-    """returns an openai-compatible client for whichever provider is configured."""
-    if not LLM_API_KEY:
-        raise Exception("no API key set — set LLM_API_KEY, SURPLUS_API_KEY, or OPENAI_API_KEY")
-    kwargs = {"api_key": LLM_API_KEY}
-    if LLM_BASE_URL:
-        kwargs["base_url"] = LLM_BASE_URL
-    return AsyncOpenAI(**kwargs)
+def get_surplus_client() -> AsyncOpenAI:
+    if not SURPLUS_API_KEY:
+        raise Exception("SURPLUS_API_KEY not set")
+    return AsyncOpenAI(api_key=SURPLUS_API_KEY, base_url=SURPLUS_BASE_URL)
 
 async def fetch_true_probabilities(match_query: str) -> dict:
-    client = get_llm_client()
-    kwargs = {
-        "model": LLM_MODEL,
-        "messages": [
+    client = get_surplus_client()
+    response = await client.chat.completions.create(
+        model=SURPLUS_MODEL,
+        messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": USER_PROMPT_TEMPLATE.format(match=match_query)}
         ],
-        "temperature": 0.1,
-        "max_tokens": 600,
-    }
-    # only openai supports response_format json_object — surplus/others may not
-    if LLM_PROVIDER == "openai":
-        kwargs["response_format"] = {"type": "json_object"}
-
-    response = await client.chat.completions.create(**kwargs)
+        temperature=0.1,
+        max_tokens=600,
+    )
     raw = response.choices[0].message.content
     return parse_llm_response(raw)
 
@@ -229,7 +216,7 @@ async def cmd_match(ctx, *, args: str):
         tp  = data["true_probabilities"]
         mf  = data["matrix_factors"]
         fc  = data.get("forecast", "N/A")
-        src = f"{LLM_PROVIDER} ({LLM_MODEL})"
+        src = f"Surplus ({SURPLUS_MODEL})"
 
         embed = discord.Embed(
             title=f"Matrix: {data.get('match_name', match_query)}",
@@ -297,7 +284,7 @@ async def cmd_match(ctx, *, args: str):
 @bot.event
 async def on_ready():
     print(f"online: {bot.user.name} ({bot.user.id})")
-    print(f"provider: {LLM_PROVIDER}  |  model: {LLM_MODEL}  |  base_url: {LLM_BASE_URL or 'default'}")
+    print(f"model: {SURPLUS_MODEL}  |  base_url: {SURPLUS_BASE_URL}")
 
 if __name__ == "__main__":
     token = os.getenv("DISCORD_BOT_TOKEN")
