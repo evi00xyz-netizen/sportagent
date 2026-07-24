@@ -4,6 +4,8 @@ import re
 import ast
 import sys
 import traceback
+import asyncio
+import signal
 import discord
 from discord.ext import commands
 from openai import AsyncOpenAI, APIStatusError
@@ -161,27 +163,20 @@ def _strip_trailing_commas(json_str: str) -> str:
     return re.sub(r',\s*([]}])', r'\1', json_str)
 
 def _normalize_double_braces(text: str) -> str:
-    """collapse {{ }} → { } — some models double-escape braces."""
     text = text.replace("{{", "{").replace("}}", "}")
     return text
 
 def extract_json(raw: str) -> str:
-    """aggressive json extraction."""
     if not raw:
         raise ValueError("empty response from llm")
-
     raw = _strip_control_chars(raw)
     raw = raw.strip().lstrip("\ufeff\u200b\u200c\u200d\u2060")
     raw = _normalize_double_braces(raw)
-
-    # case 1: markdown code block
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL | re.IGNORECASE)
     if m:
         inner = m.group(1).strip()
         if inner:
             return _strip_trailing_commas(inner)
-
-    # case 2: find { ... } via brace counting
     start = raw.find('{')
     if start != -1:
         depth = 0
@@ -193,17 +188,13 @@ def extract_json(raw: str) -> str:
                 depth -= 1
                 if depth == 0:
                     return _strip_trailing_commas(raw[start:i+1])
-
-    # case 3: no braces — bare key:value pairs
     bare = raw.strip().lstrip(',').strip()
     if '"' in bare and ':' in bare:
         wrapped = "{" + bare + "}"
         return _strip_trailing_commas(wrapped)
-
     raise ValueError(f"cannot extract json from: {raw[:500]}")
 
 def _try_json_parse(text: str) -> dict:
-    """try json.loads, then ast.literal_eval."""
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -252,7 +243,6 @@ async def fetch_true_probabilities(match_query: str) -> dict:
     client = get_surplus_client()
     sport = detect_sport(match_query)
     user_prompt = build_user_prompt(match_query)
-
     response = await client.chat.completions.create(
         model=SURPLUS_MODEL,
         messages=[
@@ -263,13 +253,10 @@ async def fetch_true_probabilities(match_query: str) -> dict:
         max_tokens=4000,
     )
     msg = response.choices[0].message
-
     raw = msg.content or ""
     if not raw and hasattr(msg, "reasoning_content") and msg.reasoning_content:
         raw = msg.reasoning_content
-
     print(f"\nLLM RAW ({SURPLUS_MODEL}): {repr(raw)[:2000]}\n", file=sys.stderr)
-
     json_str = extract_json(raw)
     data = _try_json_parse(json_str)
     return validate_llm_output(data, sport)
@@ -339,11 +326,9 @@ async def cmd_match(ctx, *, args: str):
             )
             return
         except Exception as e:
-            tb = traceback.format_exc()
-            short_tb = tb[-1500:] if len(tb) > 1500 else tb
             await ctx.send(
                 f"**Error**: {type(e).__name__}: {e}\n"
-                f"```\n{short_tb}\n```"
+                f"Try again — if this persists, check the model or API key."
             )
             return
 
@@ -418,14 +403,79 @@ async def cmd_match(ctx, *, args: str):
         embed.set_footer(text=f"Engine: {src}  |  min edge: {min_edge*100:.1f}%  |  confidence: {data.get('confidence','?')}")
         await ctx.send(embed=embed)
 
+# ── global error handler — catches all unhandled command errors ──
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Global error handler — prevents the bot from crashing on any command error."""
+    if isinstance(error, commands.CommandNotFound):
+        return  # silently ignore unknown commands
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"Missing argument. Usage: `!{ctx.command.name} <args>`")
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.send(f"Bad argument. Check the format and try again.")
+        return
+
+    # everything else — log and send a clean message, never crash
+    print(f"[ERROR] {ctx.command}: {error}", file=sys.stderr)
+    traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
+
+    try:
+        await ctx.send(
+            f"Something went wrong. The bot is still running — try again.\n"
+            f"`{type(error).__name__}`"
+        )
+    except Exception:
+        pass  # can't even send the error message — nothing we can do
+
+# ── lifecycle ───────────────────────────────────────────────
+
 @bot.event
 async def on_ready():
     print(f"online: {bot.user.name} ({bot.user.id})")
     print(f"model: {SURPLUS_MODEL}  |  base_url: {SURPLUS_BASE_URL}")
 
-if __name__ == "__main__":
+@bot.event
+async def on_disconnect():
+    print("[WARN] discord disconnected — will auto-reconnect", file=sys.stderr)
+
+@bot.event
+async def on_resumed():
+    print("[INFO] discord session resumed", file=sys.stderr)
+
+# ── main with graceful shutdown ─────────────────────────────
+
+async def main():
     token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
-        print("DISCORD_BOT_TOKEN not set")
-    else:
-        bot.run(token)
+        print("FATAL: DISCORD_BOT_TOKEN not set", file=sys.stderr)
+        sys.exit(1)
+
+    async with bot:
+        await bot.start(token)
+
+if __name__ == "__main__":
+    # handle SIGTERM/SIGINT gracefully (systemd stop, Ctrl+C)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    def shutdown():
+        print("[INFO] shutting down...", file=sys.stderr)
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, shutdown)
+        except NotImplementedError:
+            pass  # windows doesn't support add_signal_handler
+
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        print("[INFO] bot stopped cleanly", file=sys.stderr)
