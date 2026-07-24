@@ -194,16 +194,17 @@ def to_slug(text: str) -> str:
     return s.strip('-')
 
 def fetch_exact_slug_by_asset(asset_id_or_condition: str) -> str:
-    """Queries Polymarket Gamma API by asset/condition ID to retrieve the official marketSlug or event slug."""
+    """Queries Polymarket Gamma API by asset/condition ID with caching (including negative caching)."""
     if not asset_id_or_condition:
         return None
     if asset_id_or_condition in _slug_cache:
         return _slug_cache[asset_id_or_condition]
 
+    # Try clob_token_ids lookup
     try:
         url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={asset_id_or_condition}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode('utf-8'))
                 if isinstance(data, list) and len(data) > 0:
@@ -216,10 +217,11 @@ def fetch_exact_slug_by_asset(asset_id_or_condition: str) -> str:
     except Exception as e:
         print(f"[Asset Lookup Error] {e}", file=sys.stderr)
 
+    # Try condition_id lookup
     try:
         url = f"https://gamma-api.polymarket.com/markets?condition_id={asset_id_or_condition}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode('utf-8'))
                 if isinstance(data, list) and len(data) > 0:
@@ -232,6 +234,8 @@ def fetch_exact_slug_by_asset(asset_id_or_condition: str) -> str:
     except Exception as e:
         print(f"[Condition Lookup Error] {e}", file=sys.stderr)
 
+    # Negative caching so we never re-query network every 2s for failed assets
+    _slug_cache[asset_id_or_condition] = None
     return None
 
 def resolve_exact_slug(market_title: str, item_dict: dict = None) -> str:
@@ -496,6 +500,7 @@ async def bullpen_watcher_loop():
     """Background task continuously monitoring bullpen positions 24/7 across restarts."""
     global last_periodic_time
     while True:
+        loop_start = time.time()
         try:
             if bullpen_watch_state["active"]:
                 target_channel_id = bullpen_watch_state.get("channel_id") or MONITOR_CHANNEL_ID
@@ -571,8 +576,10 @@ async def bullpen_watcher_loop():
         except Exception as e:
             print(f"[Bullpen Watcher Loop Error] {e}", file=sys.stderr)
 
-        interval = max(1, bullpen_watch_state.get("interval", 2))
-        await asyncio.sleep(interval)
+        elapsed = time.time() - loop_start
+        configured_interval = float(bullpen_watch_state.get("interval", 2))
+        sleep_time = max(0.1, configured_interval - elapsed)
+        await asyncio.sleep(sleep_time)
 
 # ── sport detection ─────────────────────────────────────────
 NO_DRAW_SPORTS = {"mlb", "nba", "nfl", "nhl", "baseball", "basketball", "football", "hockey",
