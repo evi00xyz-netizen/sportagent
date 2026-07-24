@@ -180,7 +180,7 @@ def to_slug(text: str) -> str:
     return s.strip('-')
 
 def resolve_exact_slug(market_title: str) -> str:
-    """Resolves exact Polymarket marketSlug for truncated titles or sports events via Gamma API."""
+    """Resolves exact Polymarket marketSlug for truncated titles or sports events via Gamma API search endpoints."""
     if not market_title:
         return "unknown-market"
 
@@ -194,8 +194,11 @@ def resolve_exact_slug(market_title: str) -> str:
     fallback_slug = to_slug(clean_title)
 
     try:
-        q = urllib.parse.quote(clean_title)
-        url = f"https://gamma-api.polymarket.com/events?q={q}"
+        query_words = [w for w in re.split(r'\W+', clean_title.lower()) if len(w) > 2]
+        search_query = " ".join(query_words[:4]) if query_words else clean_title
+
+        q = urllib.parse.quote(search_query)
+        url = f"https://gamma-api.polymarket.com/events?search={q}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
         with urllib.request.urlopen(req, timeout=4) as response:
             if response.status == 200:
@@ -211,7 +214,7 @@ def resolve_exact_slug(market_title: str) -> str:
                         if not isinstance(ev, dict):
                             continue
                         ev_title = (ev.get("title") or "").lower()
-                        ev_slug = ev.get("slug") or ev.get("eventSlug")
+                        ev_slug = ev.get("slug") or ev.get("eventSlug") or ev.get("ticker")
 
                         markets = ev.get("markets") or []
                         for m in markets:
@@ -228,9 +231,16 @@ def resolve_exact_slug(market_title: str) -> str:
                                 best_match_count = match_count
                                 best_slug = m_slug
 
+                        if ev_slug and not best_slug:
+                            match_count = sum(1 for w in words if w in ev_title or w in ev_slug)
+                            if match_count > best_match_count:
+                                best_match_count = match_count
+                                best_slug = ev_slug
+
                     if best_slug and best_match_count >= max(1, len(words) // 3):
-                        _slug_cache[market_title] = best_slug
-                        return best_slug
+                        clean_best = re.sub(r'-+', '-', best_slug.strip())
+                        _slug_cache[market_title] = clean_best
+                        return clean_best
     except Exception as e:
         print(f"[Slug Resolve Warning] Gamma API lookup error for '{market_title}': {e}", file=sys.stderr)
 
@@ -252,6 +262,7 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
                 title = item.get("title") or item.get("market") or item.get("question") or "Unknown Market"
                 raw_slug = item.get("marketSlug") or item.get("slug") or item.get("eventSlug")
 
+                # If raw_slug is present and valid (not truncated or missing), use it directly
                 if raw_slug and isinstance(raw_slug, str) and not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug and len(raw_slug.strip()) > 0:
                     m_slug = re.sub(r'-+', '-', raw_slug.strip())
                 else:
@@ -504,7 +515,7 @@ async def bullpen_watcher_loop():
                                             description=f"Executing market sell for `{market_slug}`...",
                                             color=discord.Color.orange()
                                         )
-                                        await channel.send(embed=close_embed)
+                                        await channel.send(close_embed)
 
                                         try:
                                             shares_num = float(tp['shares'])
