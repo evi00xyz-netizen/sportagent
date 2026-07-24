@@ -6,16 +6,16 @@ import discord
 from discord.ext import commands
 import openai
 
-# environment variables configuration
-DEFAULT_MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))  # default minimum edge required
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")        # openai model name
+# ── env config ──────────────────────────────────────────────
+DEFAULT_MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")
 
-# discord bot setup
+# ── discord setup ───────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# store user/guild settings (min_edge)
+# per-guild min_edge
 user_settings = {}
 
 def get_min_edge(guild_id: int) -> float:
@@ -26,253 +26,261 @@ def set_min_edge(guild_id: int, edge: float):
         user_settings[guild_id] = {}
     user_settings[guild_id]["min_edge"] = edge
 
+# ── strict llm input schema ─────────────────────────────────
+# the prompt is a terse, structured instruction block.
+# no narrative, no examples, no markdown — just the contract.
+# odds are NEVER injected into the prompt payload.
+
+SYSTEM_PROMPT = (
+    "You are a sports probability matrix engine. "
+    "Output ONLY valid JSON matching the schema. "
+    "Never use or reference betting odds, bookmaker lines, or market prices. "
+    "Base probabilities solely on fundamental match data."
+)
+
+USER_PROMPT_TEMPLATE = (
+    'Match: "{match}"\n'
+    "Analyze using only: recent form (last 6-10), xG trends, H2H (venue-adjusted), "
+    "injuries/suspensions, tactical matchup, home advantage, fatigue/rest days.\n"
+    "Return JSON:\n"
+    "{\n"
+    '  "match_name": str,\n'
+    '  "home_team": str,\n'
+    '  "away_team": str,\n'
+    '  "true_probabilities": {"home_win": float, "draw": float, "away_win": float},\n'
+    '  "matrix_factors": {\n'
+    '    "home_form": str, "away_form": str,\n'
+    '    "home_absences": str, "away_absences": str,\n'
+    '    "tactical_edge": str\n'
+    '  },\n'
+    '  "forecast": str,\n'
+    '  "confidence": float\n'
+    "}\n"
+    "home_win+draw+away_win MUST sum to 1.0."
+)
+
+# ── strict llm output schema (validation) ───────────────────
+REQUIRED_KEYS = {
+    "match_name", "home_team", "away_team",
+    "true_probabilities", "matrix_factors", "forecast", "confidence"
+}
+PROB_KEYS = {"home_win", "draw", "away_win"}
+FACTOR_KEYS = {"home_form", "away_form", "home_absences", "away_absences", "tactical_edge"}
+
+def validate_llm_output(data: dict) -> dict:
+    """strict output validation — raises on schema violation."""
+    missing = REQUIRED_KEYS - set(data.keys())
+    if missing:
+        raise ValueError(f"missing top-level keys: {missing}")
+
+    tp = data["true_probabilities"]
+    missing_p = PROB_KEYS - set(tp.keys())
+    if missing_p:
+        raise ValueError(f"missing probability keys: {missing_p}")
+
+    total = tp["home_win"] + tp["draw"] + tp["away_win"]
+    if abs(total - 1.0) > 0.015:
+        raise ValueError(f"probabilities sum to {total:.4f}, expected 1.0")
+
+    mf = data["matrix_factors"]
+    missing_f = FACTOR_KEYS - set(mf.keys())
+    if missing_f:
+        raise ValueError(f"missing factor keys: {missing_f}")
+
+    if not isinstance(data["confidence"], (int, float)):
+        raise ValueError("confidence must be numeric")
+
+    return data
+
+# ── api clients ─────────────────────────────────────────────
+
 async def fetch_from_custom_api(match_query: str, api_url: str, api_key: str = None) -> dict:
-    """
-    queries your custom surplus intelligence API for match probability matrix data.
-    strictly avoids passing market odds into the model context.
-    all endpoints and tokens are retrieved from env vars.
-    """
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
         headers["x-api-key"] = api_key
 
-    payload = {
-        "match": match_query,
-        "mode": "probability_matrix",
-        "exclude_odds": True
-    }
+    payload = {"match": match_query, "mode": "probability_matrix", "exclude_odds": True}
 
     async with aiohttp.ClientSession() as session:
         async with session.post(api_url, json=payload, headers=headers, timeout=30) as resp:
             if resp.status != 200:
-                raise Exception(f"Custom Surplus API returned status {resp.status}: {await resp.text()}")
-            data = await resp.json()
-            return data
+                body = await resp.text()
+                raise Exception(f"custom api {resp.status}: {body[:300]}")
+            return await resp.json()
 
 async def fetch_from_openai(match_query: str) -> dict:
-    """
-    fallback: queries openai gpt / web search to calculate true win probabilities.
-    strictly excludes bookmaker odds from the prompt context.
-    """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise Exception("OPENAI_API_KEY environment variable is not configured.")
+        raise Exception("OPENAI_API_KEY not set")
 
     client = openai.AsyncOpenAI(api_key=api_key)
-    
-    prompt = f"""
-    You are an expert quantitative sports analyst and match probability matrix engine.
-    Analyze the following upcoming match: "{match_query}".
-
-    CRITICAL RULE: STRICTLY DO NOT search for, mention, or use any betting odds, bookmaker lines, or market prices.
-    Your job is to estimate the PURE TRUE WIN/DRAW/LOSS probabilities based solely on fundamental football/sports data.
-
-    Perform a match-level Probability Matrix analysis considering:
-    1. Team Form & Recent Performance (last 6-10 matches, xG trends)
-    2. Head-to-Head History (venue-adjusted)
-    3. Squad News (Injuries, Suspensions, Key Absences)
-    4. Tactical Matchup & Style of Play (Possession, Pressing, Set Pieces)
-    5. Home Advantage / Venue Factors
-    6. Fatigue / Rest Days & Travel Distance
-
-    Return your output strictly as a JSON object with this exact structure:
-    {{
-      "match_name": "Team A vs Team B",
-      "home_team": "Team A",
-      "away_team": "Team B",
-      "true_probabilities": {{
-        "home_win": 0.45,
-        "draw": 0.28,
-        "away_win": 0.27
-      }},
-      "matrix_factors": {{
-        "home_form_rating": "8/10",
-        "away_form_rating": "6/10",
-        "key_absences_home": "Player X (Injured)",
-        "key_absences_away": "None",
-        "tactical_edge": "Home team high-press favors transition against Away defense"
-      }},
-      "forecast_result": "Home Win (2-1 or 2-0 expected scoreline)",
-      "confidence_score": 0.75
-    }}
-    Ensure true_probabilities sum up to 1.0.
-    """
 
     response = await client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
-            {"role": "system", "content": "You are a quantitative sports probability matrix engine. Respond ONLY in valid JSON."},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": USER_PROMPT_TEMPLATE.format(match=match_query)}
         ],
         response_format={"type": "json_object"},
-        temperature=0.2
+        temperature=0.1,       # minimal variance for probability work
+        max_tokens=600         # cap output — schema is tight
     )
 
-    content = response.choices[0].message.content
-    return json.loads(content)
+    raw = response.choices[0].message.content
+    data = json.loads(raw)
+    return validate_llm_output(data)
 
 async def fetch_true_probabilities(match_query: str) -> dict:
-    """
-    routes match probability retrieval to custom surplus API if configured in env,
-    otherwise falls back to OpenAI GPT model using OPENAI_API_KEY and OPENAI_MODEL env vars.
-    """
-    custom_api_url = os.getenv("SURPLUS_API_URL")
-    custom_api_key = os.getenv("SURPLUS_API_KEY")
+    custom_url = os.getenv("SURPLUS_API_URL")
+    custom_key = os.getenv("SURPLUS_API_KEY")
+    if custom_url:
+        return await fetch_from_custom_api(match_query, custom_url, custom_key)
+    return await fetch_from_openai(match_query)
 
-    if custom_api_url:
-        return await fetch_from_custom_api(match_query, custom_api_url, custom_api_key)
-    else:
-        return await fetch_from_openai(match_query)
+# ── edge calculation ────────────────────────────────────────
 
 def calculate_edges(true_probs: dict, odds_home: float = None, odds_draw: float = None, odds_away: float = None):
-    """
-    calculates edge against market odds if provided.
-    devigs implied probabilities and computes edge = true_prob - implied_prob.
-    """
     if not odds_home or not odds_away:
         return None
 
-    # raw implied probabilities
-    raw_implied_h = 1.0 / odds_home
-    raw_implied_d = (1.0 / odds_draw) if odds_draw else 0.0
-    raw_implied_a = 1.0 / odds_away
+    raw_h = 1.0 / odds_home
+    raw_d = (1.0 / odds_draw) if odds_draw else 0.0
+    raw_a = 1.0 / odds_away
+    total = raw_h + raw_d + raw_a
 
-    total_implied = raw_implied_h + raw_implied_d + raw_implied_a
-
-    # de-vigged implied probabilities
-    implied_h = raw_implied_h / total_implied
-    implied_d = raw_implied_d / total_implied if odds_draw else 0.0
-    implied_a = raw_implied_a / total_implied
-
-    true_h = true_probs["home_win"]
-    true_d = true_probs.get("draw", 0.0)
-    true_a = true_probs["away_win"]
-
-    edge_h = true_h - implied_h
-    edge_d = true_d - implied_d if odds_draw else None
-    edge_a = true_a - implied_a
+    imp_h = raw_h / total
+    imp_d = raw_d / total if odds_draw else 0.0
+    imp_a = raw_a / total
 
     return {
-        "implied": {"home": implied_h, "draw": implied_d, "away": implied_a},
-        "edges": {"home": edge_h, "draw": edge_d, "away": edge_a},
-        "overround_margin": (total_implied - 1.0) * 100
+        "implied": {"home": imp_h, "draw": imp_d, "away": imp_a},
+        "edges": {
+            "home": true_probs["home_win"] - imp_h,
+            "draw": (true_probs.get("draw", 0.0) - imp_d) if odds_draw else None,
+            "away": true_probs["away_win"] - imp_a
+        },
+        "overround_pct": (total - 1.0) * 100
     }
+
+# ── discord commands ────────────────────────────────────────
 
 @bot.command(name="minedge")
 async def cmd_set_min_edge(ctx, edge_pct: float):
-    """set min edge threshold (e.g. !minedge 0.05 for 5%)"""
-    guild_id = ctx.guild.id if ctx.guild else ctx.author.id
-    set_min_edge(guild_id, edge_pct)
-    await ctx.send(f"min edge threshold updated to {edge_pct * 100:.1f}% ({edge_pct:.3f})")
+    gid = ctx.guild.id if ctx.guild else ctx.author.id
+    set_min_edge(gid, edge_pct)
+    await ctx.send(f"min edge → {edge_pct*100:.1f}%")
 
 @bot.command(name="match")
 async def cmd_match(ctx, *, args: str):
     """
-    calculate true match probabilities and check edge.
-    usage:
     !match Arsenal vs Chelsea
     !match Arsenal vs Chelsea | odds: 2.10, 3.40, 3.20
     """
     await ctx.trigger_typing()
 
     match_query = args
-    odds_home = odds_draw = odds_away = None
+    oh = od = oa = None
 
     if "|" in args:
         parts = args.split("|")
         match_query = parts[0].strip()
         odds_str = parts[1].replace("odds:", "").strip()
         try:
-            odds_vals = [float(x.strip()) for x in odds_str.split(",")]
-            if len(odds_vals) == 3:
-                odds_home, odds_draw, odds_away = odds_vals
-            elif len(odds_vals) == 2:
-                odds_home, odds_away = odds_vals
+            vals = [float(x.strip()) for x in odds_str.split(",")]
+            if len(vals) == 3:
+                oh, od, oa = vals
+            elif len(vals) == 2:
+                oh, oa = vals
         except ValueError:
-            await ctx.send("invalid odds format. use: !match Team A vs Team B | odds: 2.10, 3.40, 3.20")
+            await ctx.send("bad odds format. use: !match Team A vs Team B | odds: 2.10, 3.40, 3.20")
             return
 
-    guild_id = ctx.guild.id if ctx.guild else ctx.author.id
-    current_min_edge = get_min_edge(guild_id)
+    gid = ctx.guild.id if ctx.guild else ctx.author.id
+    min_edge = get_min_edge(gid)
 
     try:
         data = await fetch_true_probabilities(match_query)
     except Exception as e:
-        await ctx.send(f"error calculating probabilities: {str(e)}")
+        await ctx.send(f"error: {e}")
         return
 
-    true_p = data["true_probabilities"]
-    factors = data.get("matrix_factors", {})
-    forecast = data.get("forecast_result", "N/A")
-
-    source_label = "Custom Surplus Intelligence API" if os.getenv("SURPLUS_API_URL") else f"OpenAI Matrix Model ({OPENAI_MODEL})"
+    tp  = data["true_probabilities"]
+    mf  = data["matrix_factors"]
+    fc  = data.get("forecast", "N/A")
+    src = "Surplus API" if os.getenv("SURPLUS_API_URL") else f"OpenAI ({OPENAI_MODEL})"
 
     embed = discord.Embed(
-        title=f"Match Probability Matrix: {data.get('match_name', match_query)}",
+        title=f"Matrix: {data.get('match_name', match_query)}",
         color=discord.Color.blue()
     )
 
     embed.add_field(
-        name="True Win Probabilities (No Odds Bias)",
-        value=f"**{data.get('home_team', 'Home')}**: {true_p['home_win']*100:.1f}%\n"
-              f"**Draw**: {true_p.get('draw', 0)*100:.1f}%\n"
-              f"**{data.get('away_team', 'Away')}**: {true_p['away_win']*100:.1f}%",
+        name="True Probabilities (no odds bias)",
+        value=(
+            f"**{data.get('home_team','Home')}**: {tp['home_win']*100:.1f}%\n"
+            f"**Draw**: {tp.get('draw',0)*100:.1f}%\n"
+            f"**{data.get('away_team','Away')}**: {tp['away_win']*100:.1f}%"
+        ),
         inline=False
     )
+    embed.add_field(name="Forecast", value=fc, inline=False)
 
-    embed.add_field(name="Predicted Match Result", value=forecast, inline=False)
+    factor_lines = [
+        f"Home form: {mf.get('home_form','?')}",
+        f"Away form: {mf.get('away_form','?')}",
+        f"Home absences: {mf.get('home_absences','none')}",
+        f"Away absences: {mf.get('away_absences','none')}",
+        f"Tactical edge: {mf.get('tactical_edge','none')}"
+    ]
+    embed.add_field(name="Factors", value="\n".join(factor_lines), inline=False)
 
-    if factors:
-        factor_text = "\n".join([f"• **{k.replace('_', ' ').title()}**: {v}" for k, v in factors.items()])
-        embed.add_field(name="Probability Matrix Key Factors", value=factor_text, inline=False)
-
-    if odds_home and odds_away:
-        calc = calculate_edges(true_p, odds_home, odds_draw, odds_away)
-        edges = calc["edges"]
+    if oh and oa:
+        calc = calculate_edges(tp, oh, od, oa)
+        edges   = calc["edges"]
         implied = calc["implied"]
 
-        edge_msg = (
-            f"**Home Implied**: {implied['home']*100:.1f}% | **Edge**: {edges['home']*100:+.1f}%\n"
-        )
-        if odds_draw:
-            edge_msg += f"**Draw Implied**: {implied['draw']*100:.1f}% | **Edge**: {edges['draw']*100:+.1f}%\n"
-        edge_msg += f"**Away Implied**: {implied['away']*100:.1f}% | **Edge**: {edges['away']*100:+.1f}%\n"
+        edge_lines = [
+            f"Home implied: {implied['home']*100:.1f}%  |  edge: {edges['home']*100:+.1f}%"
+        ]
+        if od:
+            edge_lines.append(f"Draw implied: {implied['draw']*100:.1f}%  |  edge: {edges['draw']*100:+.1f}%")
+        edge_lines.append(f"Away implied: {implied['away']*100:.1f}%  |  edge: {edges['away']*100:+.1f}%")
 
-        embed.add_field(name="Market Edge Analysis", value=edge_msg, inline=False)
+        embed.add_field(name="Market Edge", value="\n".join(edge_lines), inline=False)
 
-        # value bet detection
-        value_bets = []
-        if edges["home"] >= current_min_edge:
-            value_bets.append(f"Home ({data.get('home_team')}) Edge: {edges['home']*100:+.1f}%")
-        if edges.get("draw") and edges["draw"] >= current_min_edge:
-            value_bets.append(f"Draw Edge: {edges['draw']*100:+.1f}%")
-        if edges["away"] >= current_min_edge:
-            value_bets.append(f"Away ({data.get('away_team')}) Edge: {edges['away']*100:+.1f}%")
+        # value bets
+        bets = []
+        if edges["home"] >= min_edge:
+            bets.append(f"Home ({data.get('home_team')}): {edges['home']*100:+.1f}%")
+        if od and edges.get("draw") and edges["draw"] >= min_edge:
+            bets.append(f"Draw: {edges['draw']*100:+.1f}%")
+        if edges["away"] >= min_edge:
+            bets.append(f"Away ({data.get('away_team')}): {edges['away']*100:+.1f}%")
 
-        if value_bets:
+        if bets:
             embed.add_field(
-                name=f"VALUE BET RECOMMENDED (Min Edge >= {current_min_edge*100:.1f}%)",
-                value="\n".join([f"✅ {vb}" for vb in value_bets]),
+                name=f"VALUE (min edge ≥ {min_edge*100:.1f}%)",
+                value="\n".join(f"✅ {b}" for b in bets),
                 inline=False
             )
         else:
             embed.add_field(
-                name=f"No Value Bet (Min Edge Threshold = {current_min_edge*100:.1f}%)",
-                value="❌ Market implied odds match or exceed true probabilities. Pass.",
+                name=f"No value (threshold {min_edge*100:.1f}%)",
+                value="Pass — no edge exceeds threshold.",
                 inline=False
             )
 
-    embed.set_footer(text=f"Engine: {source_label} | Min Edge: {current_min_edge*100:.1f}%")
+    embed.set_footer(text=f"Engine: {src}  |  min edge: {min_edge*100:.1f}%  |  confidence: {data.get('confidence','?')}")
     await ctx.send(embed=embed)
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user.name} ({bot.user.id})")
+    print(f"online: {bot.user.name} ({bot.user.id})")
 
 if __name__ == "__main__":
     token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
-        print("Error: DISCORD_BOT_TOKEN environment variable not set.")
+        print("DISCORD_BOT_TOKEN not set")
     else:
         bot.run(token)
