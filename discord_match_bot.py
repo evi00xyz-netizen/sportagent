@@ -6,15 +6,16 @@ import discord
 from discord.ext import commands
 import openai
 
-# configuration
-DEFAULT_MIN_EDGE = 0.05  # 5% default minimum edge required
+# environment variables configuration
+DEFAULT_MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))  # default minimum edge required
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")        # openai model name
 
 # discord bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# store user settings (min_edge)
+# store user/guild settings (min_edge)
 user_settings = {}
 
 def get_min_edge(guild_id: int) -> float:
@@ -27,8 +28,9 @@ def set_min_edge(guild_id: int, edge: float):
 
 async def fetch_from_custom_api(match_query: str, api_url: str, api_key: str = None) -> dict:
     """
-    queries your custom intelligence API for match probability matrix data.
+    queries your custom surplus intelligence API for match probability matrix data.
     strictly avoids passing market odds into the model context.
+    all endpoints and tokens are retrieved from env vars.
     """
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -44,16 +46,20 @@ async def fetch_from_custom_api(match_query: str, api_url: str, api_key: str = N
     async with aiohttp.ClientSession() as session:
         async with session.post(api_url, json=payload, headers=headers, timeout=30) as resp:
             if resp.status != 200:
-                raise Exception(f"Custom API returned status {resp.status}: {await resp.text()}")
+                raise Exception(f"Custom Surplus API returned status {resp.status}: {await resp.text()}")
             data = await resp.json()
             return data
 
 async def fetch_from_openai(match_query: str) -> dict:
     """
-    fallback: queries openai gpt-4o / web search to calculate true win probabilities.
+    fallback: queries openai gpt / web search to calculate true win probabilities.
     strictly excludes bookmaker odds from the prompt context.
     """
-    client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise Exception("OPENAI_API_KEY environment variable is not configured.")
+
+    client = openai.AsyncOpenAI(api_key=api_key)
     
     prompt = f"""
     You are an expert quantitative sports analyst and match probability matrix engine.
@@ -94,7 +100,7 @@ async def fetch_from_openai(match_query: str) -> dict:
     """
 
     response = await client.chat.completions.create(
-        model="gpt-4o",
+        model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": "You are a quantitative sports probability matrix engine. Respond ONLY in valid JSON."},
             {"role": "user", "content": prompt}
@@ -108,8 +114,8 @@ async def fetch_from_openai(match_query: str) -> dict:
 
 async def fetch_true_probabilities(match_query: str) -> dict:
     """
-    routes match probability retrieval to custom API if configured via environment,
-    otherwise falls back to OpenAI GPT-4o.
+    routes match probability retrieval to custom surplus API if configured in env,
+    otherwise falls back to OpenAI GPT model using OPENAI_API_KEY and OPENAI_MODEL env vars.
     """
     custom_api_url = os.getenv("SURPLUS_API_URL")
     custom_api_key = os.getenv("SURPLUS_API_KEY")
@@ -200,7 +206,7 @@ async def cmd_match(ctx, *, args: str):
     factors = data.get("matrix_factors", {})
     forecast = data.get("forecast_result", "N/A")
 
-    source_label = "Custom Surplus Intelligence API" if os.getenv("SURPLUS_API_URL") else "OpenAI Matrix Model"
+    source_label = "Custom Surplus Intelligence API" if os.getenv("SURPLUS_API_URL") else f"OpenAI Matrix Model ({OPENAI_MODEL})"
 
     embed = discord.Embed(
         title=f"Match Probability Matrix: {data.get('match_name', match_query)}",
