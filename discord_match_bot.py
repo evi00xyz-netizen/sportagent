@@ -17,6 +17,7 @@ SURPLUS_API_KEY  = os.getenv("SURPLUS_API_KEY")
 SURPLUS_BASE_URL = os.getenv("SURPLUS_API_URL", "https://api.surplusintelligence.ai/min30/v1")
 SURPLUS_MODEL    = os.getenv("SURPLUS_MODEL", "gpt-5.4")
 CONFIG_FILE      = "watcher_config.json"
+MONITOR_CHANNEL_ID = 1530286757126471822
 
 # discord embed field limit
 EMBED_FIELD_MAX = 1024
@@ -46,7 +47,7 @@ def set_min_edge(guild_id: int, edge: float):
 def load_watcher_config() -> dict:
     defaults = {
         "active": False,
-        "channel_id": None,
+        "channel_id": MONITOR_CHANNEL_ID,
         "address": None,
         "source": None,
         "stop_loss": None,
@@ -59,6 +60,8 @@ def load_watcher_config() -> dict:
             with open(CONFIG_FILE, "r") as f:
                 saved = json.load(f)
                 defaults.update(saved)
+                if not saved.get("channel_id"):
+                    defaults["channel_id"] = MONITOR_CHANNEL_ID
         except Exception as e:
             print(f"[Config Load Error] {e}", file=sys.stderr)
     return defaults
@@ -67,7 +70,7 @@ def save_watcher_config(state: dict):
     try:
         to_save = {
             "active": state.get("active", False),
-            "channel_id": state.get("channel_id"),
+            "channel_id": state.get("channel_id", MONITOR_CHANNEL_ID),
             "address": state.get("address"),
             "source": state.get("source"),
             "stop_loss": state.get("stop_loss"),
@@ -104,8 +107,9 @@ async def bullpen_watcher_loop():
     """Background task continuously monitoring bullpen positions 24/7 across restarts."""
     while True:
         try:
-            if bullpen_watch_state["active"] and bullpen_watch_state["channel_id"]:
-                channel = bot.get_channel(bullpen_watch_state["channel_id"])
+            if bullpen_watch_state["active"]:
+                target_channel_id = bullpen_watch_state.get("channel_id") or MONITOR_CHANNEL_ID
+                channel = bot.get_channel(target_channel_id)
                 if channel:
                     addr = bullpen_watch_state.get("address")
                     src = bullpen_watch_state.get("source")
@@ -449,7 +453,7 @@ async def cmd_positions(ctx, *, args: str = ""):
 async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
     """Start/stop watching bullpen positions 24/7 with optional stop-loss trigger.
     Usage:
-      !watchbullpen start [--address 0x...] [--source bullpen|polymarket] [--sl 15] [--interval 1]
+      !watchbullpen start [--address 0x...] [--source bullpen|polymarket] [--sl 15] [--interval 1] [--channel <id>]
       !watchbullpen stop
       !watchbullpen status
     """
@@ -463,9 +467,10 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         return
 
     if act == "status":
+        target_ch = bullpen_watch_state.get('channel_id') or MONITOR_CHANNEL_ID
         status_str = (
             f"**Status:** {'🟢 Active (24/7 Monitoring)' if bullpen_watch_state.get('active') else '🔴 Stopped'}\n"
-            f"**Channel:** <#{bullpen_watch_state.get('channel_id') or 'None'}>\n"
+            f"**Channel:** <#{target_ch}>\n"
             f"**Address:** `{bullpen_watch_state.get('address') or 'Default'}`\n"
             f"**Source:** `{bullpen_watch_state.get('source') or 'Default'}`\n"
             f"**Stop Loss:** `{f'{bullpen_watch_state.get(\"stop_loss\")}%' if bullpen_watch_state.get('stop_loss') else 'None'}`\n"
@@ -479,6 +484,13 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         src = None
         sl = None
         interval = 1
+        target_ch = MONITOR_CHANNEL_ID
+
+        if "--channel" in args:
+            m = re.search(r"--channel\s+(\d+)", args)
+            if m: target_ch = int(m.group(1))
+        elif ctx.channel.id:
+            target_ch = ctx.channel.id
 
         if "--address" in args:
             m = re.search(r"--address\s+([^\s]+)", args)
@@ -494,7 +506,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
             if m: interval = int(m.group(1))
 
         bullpen_watch_state["active"] = True
-        bullpen_watch_state["channel_id"] = ctx.channel.id
+        bullpen_watch_state["channel_id"] = target_ch
         bullpen_watch_state["address"] = addr
         bullpen_watch_state["source"] = src
         bullpen_watch_state["stop_loss"] = sl
@@ -503,7 +515,8 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         save_watcher_config(bullpen_watch_state)
 
         msg = (
-            f"🟢 **Started 24/7 background watching of Bullpen positions in this channel!**\n"
+            f"🟢 **Started 24/7 background watching of Bullpen positions!**\n"
+            f"• Target Channel: <#{target_ch}>\n"
             f"• Interval: `{interval}s`\n"
             f"• Address: `{addr or 'Default'}`\n"
             f"• Source: `{src or 'Default'}`\n"
@@ -664,7 +677,8 @@ async def on_ready():
     if bullpen_watch_state.get("task") is None:
         bullpen_watch_state["task"] = asyncio.create_task(bullpen_watcher_loop())
     if bullpen_watch_state.get("active"):
-        print(f"[INFO] bullpen watcher auto-started from config for channel {bullpen_watch_state.get('channel_id')}")
+        target_ch = bullpen_watch_state.get('channel_id') or MONITOR_CHANNEL_ID
+        print(f"[INFO] bullpen watcher auto-started from config for channel {target_ch}")
 
 @bot.event
 async def on_disconnect():
