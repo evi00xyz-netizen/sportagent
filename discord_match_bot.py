@@ -37,7 +37,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 user_settings = {}
 
 def get_min_edge(guild_id: int) -> float:
-    return user_settings.get(guild_id, {}).get("min_edge", DEFAULT_MIN_EDGE)
+    return user_settings.get(guild_id, {}).get("min_edge", DEFAULT_DEFAULT_EDGE if 'DEFAULT_DEFAULT_EDGE' in globals() else DEFAULT_MIN_EDGE)
 
 def set_min_edge(guild_id: int, edge: float):
     if guild_id not in user_settings:
@@ -88,40 +88,46 @@ bullpen_watch_state = load_watcher_config()
 bullpen_watch_state["task"] = None
 
 def get_bullpen_binary_path() -> str:
-    """Finds the absolute path to the bullpen executable."""
-    candidate = shutil.which("bullpen")
-    if candidate:
-        return candidate
-    common_paths = [
+    """Finds the absolute path to the valid bullpen executable."""
+    priority_paths = [
         "/root/.bullpen/bin/bullpen",
         os.path.expanduser("~/.bullpen/bin/bullpen"),
+    ]
+    for p in priority_paths:
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+
+    candidate = shutil.which("bullpen")
+    if candidate and candidate != "/usr/local/bin/bullpen":
+        return candidate
+
+    fallback_paths = [
         "/usr/local/bin/bullpen",
         "/usr/bin/bullpen"
     ]
-    for p in common_paths:
+    for p in fallback_paths:
         if os.path.exists(p) and os.access(p, os.X_OK):
             return p
+
     return "bullpen"
 
 def run_bullpen_positions(address: str = None, source: str = None) -> str:
-    """Executes the `bullpen polymarket positions` CLI command via shell execution."""
+    """Executes the `bullpen polymarket positions` CLI command via subprocess."""
     bin_path = get_bullpen_binary_path()
     cmd_parts = [bin_path, "polymarket", "positions"]
     if address:
         cmd_parts.extend(["--address", address])
     if source:
         cmd_parts.extend(["--source", source])
-    
-    cmd_str = " ".join(cmd_parts)
 
-    # Ensure PATH includes ~/.bullpen/bin
+    # Ensure PATH includes ~/.bullpen/bin at the front
     env = os.environ.copy()
     bullpen_bin_dir = os.path.expanduser("~/.bullpen/bin")
-    if os.path.exists(bullpen_bin_dir) and bullpen_bin_dir not in env.get("PATH", ""):
+    if os.path.exists(bullpen_bin_dir):
         env["PATH"] = f"{bullpen_bin_dir}:{env.get('PATH', '')}"
 
     try:
-        res = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, check=True, timeout=10, env=env)
+        res = subprocess.run(cmd_parts, capture_output=True, text=True, check=True, timeout=10, env=env)
         return res.stdout.strip()
     except subprocess.TimeoutExpired:
         return "[Error] `bullpen` CLI command timed out after 10 seconds."
@@ -148,7 +154,7 @@ async def bullpen_watcher_loop():
                     last_pos = bullpen_watch_state.get("last_positions")
 
                     pos_output = await asyncio.to_thread(run_bullpen_positions, addr, src)
-                    
+
                     # Do not trigger position change alerts or SL on CLI errors
                     if pos_output.startswith("[Error]") or pos_output.startswith("[Bullpen Error]"):
                         print(f"[Bullpen Watcher CLI Warning] {pos_output}", file=sys.stderr)
@@ -471,7 +477,7 @@ async def cmd_positions(ctx, *, args: str = ""):
                 src = m.group(1)
 
         output = await asyncio.to_thread(run_bullpen_positions, addr, src)
-        
+
         embed = discord.Embed(
             title="Bullpen Polymarket Positions",
             description=f"```\n{_trunc(output, 2000)}\n```",
