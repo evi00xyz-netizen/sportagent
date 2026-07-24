@@ -38,24 +38,26 @@ SYSTEM_PROMPT = (
     "Base probabilities solely on fundamental match data."
 )
 
+# NOTE: all {{ and }} are escaped for Python's str.format().
+# Only {match} is a real placeholder.
 USER_PROMPT_TEMPLATE = (
     'Match: "{match}"\n'
     "Analyze using only: recent form (last 6-10), xG trends, H2H (venue-adjusted), "
     "injuries/suspensions, tactical matchup, home advantage, fatigue/rest days.\n"
     "Return JSON:\n"
-    "{\n"
+    "{{\n"
     '  "match_name": str,\n'
     '  "home_team": str,\n'
     '  "away_team": str,\n'
-    '  "true_probabilities": {"home_win": float, "draw": float, "away_win": float},\n'
-    '  "matrix_factors": {\n'
+    '  "true_probabilities": {{"home_win": float, "draw": float, "away_win": float}},\n'
+    '  "matrix_factors": {{\n'
     '    "home_form": str, "away_form": str,\n'
     '    "home_absences": str, "away_absences": str,\n'
     '    "tactical_edge": str\n'
-    '  },\n'
+    '  }},\n'
     '  "forecast": str,\n'
     '  "confidence": float\n'
-    "}\n"
+    "}}\n"
     "home_win+draw+away_win MUST sum to 1.0."
 )
 
@@ -227,7 +229,6 @@ async def cmd_match(ctx, *, args: str):
         try:
             data = await fetch_true_probabilities(match_query)
         except APIStatusError as e:
-            # surplus API returned an error — show it in full
             await ctx.send(
                 f"**Surplus API error** (status {e.status_code}):\n"
                 f"```\n{e.message}\n```\n"
@@ -235,7 +236,6 @@ async def cmd_match(ctx, *, args: str):
             )
             return
         except Exception as e:
-            # any other error — include full traceback so we can debug
             tb = traceback.format_exc()
             short_tb = tb[-1500:] if len(tb) > 1500 else tb
             await ctx.send(
