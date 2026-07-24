@@ -30,6 +30,85 @@ def set_min_edge(guild_id: int, edge: float):
         user_settings[guild_id] = {}
     user_settings[guild_id]["min_edge"] = edge
 
+# ── sport detection ─────────────────────────────────────────
+# sports where draws are impossible (always a winner after OT/extra innings)
+NO_DRAW_SPORTS = {"mlb", "nba", "nfl", "nhl", "baseball", "basketball", "football", "hockey",
+                  "american football", "ice hockey"}
+
+# team name → sport mapping for common teams across major leagues
+TEAM_SPORT_MAP = {
+    # MLB
+    "diamondbacks": "mlb", "braves": "mlb", "orioles": "mlb", "red sox": "mlb",
+    "cubs": "mlb", "white sox": "mlb", "reds": "mlb", "guardians": "mlb",
+    "rockies": "mlb", "tigers": "mlb", "astros": "mlb", "royals": "mlb",
+    "angels": "mlb", "dodgers": "mlb", "marlins": "mlb", "brewers": "mlb",
+    "twins": "mlb", "mets": "mlb", "yankees": "mlb", "athletics": "mlb",
+    "phillies": "mlb", "pirates": "mlb", "padres": "mlb", "giants": "mlb",
+    "mariners": "mlb", "cardinals": "mlb", "rays": "mlb", "rangers": "mlb",
+    "blue jays": "mlb", "nationals": "mlb",
+    # NBA
+    "celtics": "nba", "nets": "nba", "knicks": "nba", "76ers": "nba",
+    "raptors": "nba", "bulls": "nba", "cavaliers": "nba", "pistons": "nba",
+    "pacers": "nba", "bucks": "nba", "hawks": "nba", "hornets": "nba",
+    "heat": "nba", "magic": "nba", "wizards": "nba", "nuggets": "nba",
+    "timberwolves": "nba", "thunder": "nba", "trail blazers": "nba",
+    "jazz": "nba", "warriors": "nba", "clippers": "nba", "lakers": "nba",
+    "suns": "nba", "kings": "nba", "mavericks": "nba", "rockets": "nba",
+    "grizzlies": "nba", "pelicans": "nba", "spurs": "nba",
+    # NFL
+    "patriots": "nfl", "dolphins": "nfl", "jets": "nfl", "bills": "nfl",
+    "ravens": "nfl", "steelers": "nfl", "browns": "nfl", "bengals": "nfl",
+    "texans": "nfl", "colts": "nfl", "jaguars": "nfl", "titans": "nfl",
+    "broncos": "nfl", "chiefs": "nfl", "raiders": "nfl", "chargers": "nfl",
+    "cowboys": "nfl", "commanders": "nfl", "eagles": "nfl",
+    "packers": "nfl", "lions": "nfl", "vikings": "nfl", "bears": "nfl",
+    "buccaneers": "nfl", "saints": "nfl", "panthers": "nfl", "falcons": "nfl",
+    "rams": "nfl", "49ers": "nfl", "seahawks": "nfl", "cardinals": "nfl",
+    # NHL
+    "bruins": "nhl", "sabres": "nhl", "red wings": "nhl", "panthers": "nhl",
+    "canadiens": "nhl", "senators": "nhl", "lightning": "nhl", "maple leafs": "nhl",
+    "hurricanes": "nhl", "blue jackets": "nhl", "devils": "nhl", "islanders": "nhl",
+    "rangers": "nhl", "flyers": "nhl", "penguins": "nhl",
+    "blackhawks": "nhl", "avalanche": "nhl", "stars": "nhl", "wild": "nhl",
+    "predators": "nhl", "blues": "nhl", "jets": "nhl",
+    "ducks": "nhl", "flames": "nhl", "oilers": "nhl", "kings": "nhl",
+    "sharks": "nhl", "kraken": "nhl", "canucks": "nhl", "golden knights": "nhl",
+    "capitals": "nhl", "coyotes": "nhl",
+}
+
+def detect_sport(match_query: str) -> str:
+    """Detect the sport from the match query string.
+    Returns 'mlb', 'nba', 'nfl', 'nhl', or 'soccer' (default)."""
+    query_lower = match_query.lower()
+
+    # check for explicit sport keywords
+    for sport in NO_DRAW_SPORTS:
+        if sport in query_lower:
+            if sport in ("baseball",):
+                return "mlb"
+            if sport in ("basketball",):
+                return "nba"
+            if sport in ("football", "american football"):
+                return "nfl"
+            if sport in ("hockey", "ice hockey"):
+                return "nhl"
+            return sport  # mlb, nba, nfl, nhl
+
+    # check team names
+    for team, sport in TEAM_SPORT_MAP.items():
+        if team in query_lower:
+            return sport
+
+    # check for "vs" pattern with known team indicators
+    # if we see "vs" and both sides look like team names, default to soccer
+    if " vs " in query_lower or " vs. " in query_lower:
+        return "soccer"
+
+    return "unknown"
+
+def sport_has_draws(sport: str) -> bool:
+    return sport not in ("mlb", "nba", "nfl", "nhl")
+
 # ── strict llm input schema ─────────────────────────────────
 SYSTEM_PROMPT = (
     "You are a sports probability matrix engine. "
@@ -38,10 +117,10 @@ SYSTEM_PROMPT = (
     "Base probabilities solely on fundamental match data."
 )
 
-# NOTE: all {{ and }} are escaped for Python's str.format().
-# Only {match} is a real placeholder.
 USER_PROMPT_TEMPLATE = (
     'Match: "{match}"\n'
+    "Sport: {sport}\n"
+    "Draws possible: {draws_possible}\n"
     "Analyze using only: recent form (last 6-10), xG trends, H2H (venue-adjusted), "
     "injuries/suspensions, tactical matchup, home advantage, fatigue/rest days.\n"
     "Return JSON:\n"
@@ -58,8 +137,28 @@ USER_PROMPT_TEMPLATE = (
     '  "forecast": str,\n'
     '  "confidence": float\n'
     "}}\n"
+    "{draw_rule}"
     "home_win+draw+away_win MUST sum to 1.0."
 )
+
+def build_user_prompt(match_query: str) -> str:
+    sport = detect_sport(match_query)
+    draws_possible = sport_has_draws(sport)
+
+    if draws_possible:
+        draw_rule = ""
+    else:
+        draw_rule = (
+            f"IMPORTANT: {sport.upper()} does NOT have draws. "
+            "Set draw to 0.0. Only home_win and away_win should sum to 1.0.\n"
+        )
+
+    return USER_PROMPT_TEMPLATE.format(
+        match=match_query,
+        sport=sport.upper(),
+        draws_possible="yes" if draws_possible else "no",
+        draw_rule=draw_rule
+    )
 
 # ── strict llm output schema (validation) ───────────────────
 REQUIRED_KEYS = {
@@ -127,7 +226,7 @@ def _try_json_parse(text: str) -> dict:
         pass
     raise ValueError(f"cannot parse as json or python dict. text[:500]: {text[:500]}")
 
-def validate_llm_output(data: dict) -> dict:
+def validate_llm_output(data: dict, sport: str) -> dict:
     missing = REQUIRED_KEYS - set(data.keys())
     if missing:
         raise ValueError(f"missing top-level keys: {missing}")
@@ -138,6 +237,16 @@ def validate_llm_output(data: dict) -> dict:
     total = tp["home_win"] + tp["draw"] + tp["away_win"]
     if abs(total - 1.0) > 0.015:
         raise ValueError(f"probabilities sum to {total:.4f}, expected 1.0")
+
+    # for no-draw sports, force draw to 0.0 regardless of what the model returned
+    if not sport_has_draws(sport):
+        tp["draw"] = 0.0
+        # re-normalize home_win + away_win to 1.0
+        hw_aw = tp["home_win"] + tp["away_win"]
+        if hw_aw > 0:
+            tp["home_win"] = tp["home_win"] / hw_aw
+            tp["away_win"] = tp["away_win"] / hw_aw
+
     mf = data["matrix_factors"]
     missing_f = FACTOR_KEYS - set(mf.keys())
     if missing_f:
@@ -155,14 +264,17 @@ def get_surplus_client() -> AsyncOpenAI:
 
 async def fetch_true_probabilities(match_query: str) -> dict:
     client = get_surplus_client()
+    sport = detect_sport(match_query)
+    user_prompt = build_user_prompt(match_query)
+
     response = await client.chat.completions.create(
         model=SURPLUS_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": USER_PROMPT_TEMPLATE.format(match=match_query)}
+            {"role": "user",   "content": user_prompt}
         ],
         temperature=0.1,
-        max_tokens=2000,  # bumped for reasoning models (glm-5.2 uses reasoning_content)
+        max_tokens=2000,
     )
     msg = response.choices[0].message
 
@@ -176,7 +288,7 @@ async def fetch_true_probabilities(match_query: str) -> dict:
 
     json_str = extract_json(raw)
     data = _try_json_parse(json_str)
-    return validate_llm_output(data)
+    return validate_llm_output(data, sport)
 
 # ── edge calculation ────────────────────────────────────────
 
@@ -230,6 +342,8 @@ async def cmd_match(ctx, *, args: str):
 
         gid = ctx.guild.id if ctx.guild else ctx.author.id
         min_edge = get_min_edge(gid)
+        sport = detect_sport(match_query)
+        has_draws = sport_has_draws(sport)
 
         try:
             data = await fetch_true_probabilities(match_query)
@@ -255,17 +369,20 @@ async def cmd_match(ctx, *, args: str):
         src = f"Surplus ({SURPLUS_MODEL})"
 
         embed = discord.Embed(
-            title=f"Matrix: {data.get('match_name', match_query)}",
+            title=f"Matrix: {data.get('match_name', match_query)} ({sport.upper()})",
             color=discord.Color.blue()
         )
 
+        probs_text = (
+            f"**{data.get('home_team','Home')}**: {tp['home_win']*100:.1f}%\n"
+        )
+        if has_draws:
+            probs_text += f"**Draw**: {tp.get('draw',0)*100:.1f}%\n"
+        probs_text += f"**{data.get('away_team','Away')}**: {tp['away_win']*100:.1f}%"
+
         embed.add_field(
             name="True Probabilities (no odds bias)",
-            value=(
-                f"**{data.get('home_team','Home')}**: {tp['home_win']*100:.1f}%\n"
-                f"**Draw**: {tp.get('draw',0)*100:.1f}%\n"
-                f"**{data.get('away_team','Away')}**: {tp['away_win']*100:.1f}%"
-            ),
+            value=probs_text,
             inline=False
         )
         embed.add_field(name="Forecast", value=fc, inline=False)
@@ -287,7 +404,7 @@ async def cmd_match(ctx, *, args: str):
             edge_lines = [
                 f"Home implied: {implied['home']*100:.1f}%  |  edge: {edges['home']*100:+.1f}%"
             ]
-            if od:
+            if has_draws and od:
                 edge_lines.append(f"Draw implied: {implied['draw']*100:.1f}%  |  edge: {edges['draw']*100:+.1f}%")
             edge_lines.append(f"Away implied: {implied['away']*100:.1f}%  |  edge: {edges['away']*100:+.1f}%")
 
@@ -296,7 +413,7 @@ async def cmd_match(ctx, *, args: str):
             bets = []
             if edges["home"] >= min_edge:
                 bets.append(f"Home ({data.get('home_team')}): {edges['home']*100:+.1f}%")
-            if od and edges.get("draw") and edges["draw"] >= min_edge:
+            if has_draws and od and edges.get("draw") and edges["draw"] >= min_edge:
                 bets.append(f"Draw: {edges['draw']*100:+.1f}%")
             if edges["away"] >= min_edge:
                 bets.append(f"Away ({data.get('away_team')}): {edges['away']*100:+.1f}%")
