@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import sys
 import discord
 from discord.ext import commands
 from openai import AsyncOpenAI
@@ -65,29 +66,50 @@ PROB_KEYS = {"home_win", "draw", "away_win"}
 FACTOR_KEYS = {"home_form", "away_form", "home_absences", "away_absences", "tactical_edge"}
 
 def extract_json(raw: str) -> str:
-    """bulletproof json extraction from any llm output."""
+    """aggressive json extraction — handles every llm output format."""
     if not raw:
         raise ValueError("empty response from llm")
 
-    raw = raw.strip()
+    # strip BOM, zero-width chars, all unicode whitespace
+    raw = raw.strip().lstrip("\ufeff\u200b\u200c\u200d\u2060")
 
-    # try markdown code block: ```json ... ``` or ``` ... ```
+    # case 1: markdown code block ```json ... ``` or ``` ... ```
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL)
     if m:
-        return m.group(1).strip()
+        inner = m.group(1).strip()
+        if inner:
+            return _find_braces(inner, raw)
 
-    # find first { and last } — strip everything before/after
-    start = raw.find('{')
-    end = raw.rfind('}')
-    if start != -1 and end != -1 and end > start:
-        return raw[start:end+1].strip()
+    # case 2: look for json object { ... }
+    return _find_braces(raw, raw)
 
-    # last resort: try to find any json-like structure
-    m = re.search(r'\{.*\}', raw, re.DOTALL)
-    if m:
-        return m.group(0).strip()
+def _find_braces(text: str, fallback_raw: str) -> str:
+    """find first { and matching } and return the substring."""
+    start = text.find('{')
+    if start == -1:
+        raise ValueError(
+            f"no opening brace in llm response. raw (first 500 chars): {fallback_raw[:500]}"
+        )
 
-    raise ValueError(f"no json found in llm response. raw (first 300 chars): {raw[:300]}")
+    # walk forward counting braces to find matching closing }
+    depth = 0
+    end = -1
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+
+    if end == -1:
+        raise ValueError(
+            f"unmatched braces in llm response. raw (first 500 chars): {fallback_raw[:500]}"
+        )
+
+    return text[start:end+1]
 
 def validate_llm_output(data: dict) -> dict:
     """strict output validation — raises on schema violation."""
@@ -115,16 +137,18 @@ def validate_llm_output(data: dict) -> dict:
     return data
 
 def parse_llm_response(raw: str) -> dict:
-    """extract json from llm response and validate it."""
-    json_str = extract_json(raw)
+    """extract json from llm response and validate it. logs raw to stderr on failure."""
     try:
+        json_str = extract_json(raw)
         data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"invalid json from llm: {e}\n"
-            f"extracted json string (first 500 chars): {json_str[:500]}"
-        )
-    return validate_llm_output(data)
+        return validate_llm_output(data)
+    except Exception:
+        # dump raw response to stderr so user can see what the model returned
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"LLM RAW RESPONSE:", file=sys.stderr)
+        print(repr(raw), file=sys.stderr)
+        print(f"{'='*60}\n", file=sys.stderr)
+        raise
 
 # ── api client ──────────────────────────────────────────────
 
