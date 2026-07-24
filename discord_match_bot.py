@@ -50,7 +50,7 @@ def load_watcher_config() -> dict:
         "address": None,
         "source": None,
         "stop_loss": None,
-        "interval": 60,
+        "interval": 1,
         "notify_on_change": True,
         "last_positions": None
     }
@@ -71,7 +71,7 @@ def save_watcher_config(state: dict):
             "address": state.get("address"),
             "source": state.get("source"),
             "stop_loss": state.get("stop_loss"),
-            "interval": state.get("interval", 60),
+            "interval": state.get("interval", 1),
             "notify_on_change": state.get("notify_on_change", True),
             "last_positions": state.get("last_positions")
         }
@@ -149,7 +149,7 @@ async def bullpen_watcher_loop():
         except Exception as e:
             print(f"[Bullpen Watcher Error] {e}", file=sys.stderr)
 
-        interval = bullpen_watch_state.get("interval", 60)
+        interval = bullpen_watch_state.get("interval", 1)
         await asyncio.sleep(interval)
 
 # ── sport detection ─────────────────────────────────────────
@@ -449,7 +449,7 @@ async def cmd_positions(ctx, *, args: str = ""):
 async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
     """Start/stop watching bullpen positions 24/7 with optional stop-loss trigger.
     Usage:
-      !watchbullpen start [--address 0x...] [--source bullpen|polymarket] [--sl 15] [--interval 60]
+      !watchbullpen start [--address 0x...] [--source bullpen|polymarket] [--sl 15] [--interval 1]
       !watchbullpen stop
       !watchbullpen status
     """
@@ -469,7 +469,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
             f"**Address:** `{bullpen_watch_state.get('address') or 'Default'}`\n"
             f"**Source:** `{bullpen_watch_state.get('source') or 'Default'}`\n"
             f"**Stop Loss:** `{f'{bullpen_watch_state.get(\"stop_loss\")}%' if bullpen_watch_state.get('stop_loss') else 'None'}`\n"
-            f"**Interval:** `{bullpen_watch_state.get('interval', 60)}s`"
+            f"**Interval:** `{bullpen_watch_state.get('interval', 1)}s`"
         )
         await ctx.send(embed=discord.Embed(title="Bullpen Watcher Status", description=status_str, color=discord.Color.blue()))
         return
@@ -478,7 +478,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         addr = None
         src = None
         sl = None
-        interval = 60
+        interval = 1
 
         if "--address" in args:
             m = re.search(r"--address\s+([^\s]+)", args)
