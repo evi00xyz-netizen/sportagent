@@ -170,6 +170,8 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
     except Exception as e:
         return f"[Sell Error] Failed to sell position: {e}"
 
+_slug_cache = {}
+
 def to_slug(text: str) -> str:
     """Converts a market question string into a basic slug."""
     s = text.lower().replace("…", "").replace("...", "").replace(" ", "-")
@@ -178,6 +180,12 @@ def to_slug(text: str) -> str:
 
 def resolve_exact_slug(market_title: str) -> str:
     """Resolves exact Polymarket marketSlug for truncated titles or sports events via Gamma API."""
+    if not market_title:
+        return "unknown-market"
+
+    if market_title in _slug_cache:
+        return _slug_cache[market_title]
+
     clean_title = market_title.replace("…", "").replace("...", "").strip()
     if not clean_title:
         return "unknown-market"
@@ -192,22 +200,28 @@ def resolve_exact_slug(market_title: str) -> str:
                 if isinstance(data, list) and len(data) > 0:
                     for ev in data:
                         if isinstance(ev, dict):
-                            if ev.get("slug"):
-                                return ev["slug"]
-                            if ev.get("eventSlug"):
-                                return ev["eventSlug"]
                             markets = ev.get("markets")
                             if isinstance(markets, list):
                                 for m in markets:
                                     if isinstance(m, dict):
                                         if m.get("marketSlug"):
+                                            _slug_cache[market_title] = m["marketSlug"]
                                             return m["marketSlug"]
                                         if m.get("slug"):
+                                            _slug_cache[market_title] = m["slug"]
                                             return m["slug"]
+                            if ev.get("slug"):
+                                _slug_cache[market_title] = ev["slug"]
+                                return ev["slug"]
+                            if ev.get("eventSlug"):
+                                _slug_cache[market_title] = ev["eventSlug"]
+                                return ev["eventSlug"]
     except Exception as e:
         print(f"[Slug Resolve Warning] Gamma API lookup error for '{market_title}': {e}", file=sys.stderr)
 
-    return to_slug(market_title)
+    res = to_slug(clean_title)
+    _slug_cache[market_title] = res
+    return res
 
 def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
     """Parses CLI output (JSON or table) into header text and individual position objects."""
@@ -221,10 +235,16 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
             parsed_positions = []
             total_pnl = 0.0
             for item in data:
-                m_slug = item.get("marketSlug") or item.get("eventSlug") or item.get("slug")
                 title = item.get("title") or item.get("market") or item.get("question") or "Unknown Market"
-                if not m_slug or len(m_slug) < 3 or m_slug.endswith("-"):
-                    m_slug = resolve_exact_slug(title)
+                raw_slug = item.get("marketSlug") or item.get("eventSlug") or item.get("slug")
+
+                resolved = resolve_exact_slug(title)
+                if resolved and resolved != "unknown-market":
+                    m_slug = resolved
+                elif raw_slug and not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug:
+                    m_slug = raw_slug
+                else:
+                    m_slug = to_slug(title)
 
                 outcome = item.get("outcome") or item.get("outcomeName") or "Yes"
                 status = item.get("status", "open")
@@ -1068,7 +1088,7 @@ async def on_ready():
 
 @bot.event
 async def on_disconnect():
-    print("[WARN] discord disconnected — will auto-reconnect", file=sys.stderr)
+    print("[WARN] disconnected — will auto-reconnect", file=sys.stderr)
 
 @bot.event
 async def on_resumed():
