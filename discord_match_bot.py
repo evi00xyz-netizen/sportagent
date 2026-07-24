@@ -681,7 +681,7 @@ async def on_ready():
     print(f"online: {bot.user.name} ({bot.user.id})")
     print(f"model: {SURPLUS_MODEL}  |  base_url: {SURPLUS_BASE_URL}")
     if bullpen_watch_state.get("task") is None:
-        bullpen_watch_state["task"] = asyncio.io_task = asyncio.create_task(bullpen_watcher_loop())
+        bullpen_watch_state["task"] = asyncio.create_task(bullpen_watcher_loop())
     if bullpen_watch_state.get("active"):
         target_ch = bullpen_watch_state.get('channel_id') or MONITOR_CHANNEL_ID
         print(f"[INFO] bullpen watcher auto-started from config for channel {target_ch}")
