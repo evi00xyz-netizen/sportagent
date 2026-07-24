@@ -137,18 +137,10 @@ def validate_llm_output(data: dict) -> dict:
     return data
 
 def parse_llm_response(raw: str) -> dict:
-    """extract json from llm response and validate it. logs raw to stderr on failure."""
-    try:
-        json_str = extract_json(raw)
-        data = json.loads(json_str)
-        return validate_llm_output(data)
-    except Exception:
-        # dump raw response to stderr so user can see what the model returned
-        print(f"\n{'='*60}", file=sys.stderr)
-        print(f"LLM RAW RESPONSE:", file=sys.stderr)
-        print(repr(raw), file=sys.stderr)
-        print(f"{'='*60}\n", file=sys.stderr)
-        raise
+    """extract json from llm response and validate it. returns the raw string on failure so caller can log it."""
+    json_str = extract_json(raw)
+    data = json.loads(json_str)
+    return validate_llm_output(data)
 
 # ── api client ──────────────────────────────────────────────
 
@@ -169,6 +161,12 @@ async def fetch_true_probabilities(match_query: str) -> dict:
         max_tokens=600,
     )
     raw = response.choices[0].message.content
+
+    print(f"\n{'='*60}", file=sys.stderr)
+    print(f"LLM RAW RESPONSE:", file=sys.stderr)
+    print(repr(raw), file=sys.stderr)
+    print(f"{'='*60}\n", file=sys.stderr)
+
     return parse_llm_response(raw)
 
 # ── edge calculation ────────────────────────────────────────
@@ -234,7 +232,8 @@ async def cmd_match(ctx, *, args: str):
         try:
             data = await fetch_true_probabilities(match_query)
         except Exception as e:
-            await ctx.send(f"error: {e}")
+            # include the full error so we can debug
+            await ctx.send(f"**error**: {e}")
             return
 
         tp  = data["true_probabilities"]
