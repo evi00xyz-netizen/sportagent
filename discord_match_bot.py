@@ -711,6 +711,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
     """Start/stop watching bullpen positions 24/7 with optional stop-loss trigger.
     Usage:
       !watchbullpen start [--address 0x...] [--source bullpen|polymarket] [--sl 15] [--interval 2] [--channel <id>]
+      watchbullpen start --sl 25
       !watchbullpen stop
       !watchbullpen status
     """
@@ -792,7 +793,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         await ctx.send(msg)
         return
 
-    await ctx.send("Usage: `!watchbullpen start|stop|status [options]`")
+    await ctx.send("Usage: `watchbullpen start|stop|status [--sl <pct>]` or `!watchbullpen start|stop|status`")
 
 @bot.command(name="minedge")
 async def cmd_set_min_edge(ctx, edge_pct: float):
@@ -918,11 +919,18 @@ async def cmd_match(ctx, *, args: str):
 async def on_message(message):
     if message.author.bot:
         return
-    content_lower = message.content.strip().lower()
+    content_raw = message.content.strip()
+    content_lower = content_raw.lower()
+
     if content_lower in ("open", "positions"):
         ctx = await bot.get_context(message)
         await cmd_open(ctx)
         return
+
+    # Handle watchbullpen without '!' prefix
+    if content_lower.startswith("watchbullpen"):
+        message.content = "!" + content_raw
+
     await bot.process_commands(message)
 
 # ── global error handler ────────────────────────────────────
@@ -932,17 +940,17 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"Missing argument. Usage: `!{ctx.command.name} <args>`")
+        await ctx.send(f"❌ Missing argument. Usage: `watchbullpen start --sl 25` or `!{ctx.command.name} <args>`")
         return
     if isinstance(error, commands.BadArgument):
-        await ctx.send(f"Bad argument. Check the format and try again.")
+        await ctx.send(f"❌ Bad argument format. Check your inputs and try again.")
         return
     print(f"[ERROR] {ctx.command}: {error}", file=sys.stderr)
     traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
     try:
         await ctx.send(
-            f"Something went wrong. The bot is still running — try again.\n"
-            f"`{type(error).__name__}`"
+            f"❌ **Command Failed**: `{type(error).__name__}`\n"
+            f"Details: {error}"
         )
     except Exception:
         pass
