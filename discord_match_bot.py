@@ -104,14 +104,16 @@ def get_bullpen_binary_path() -> str:
     return "bullpen"
 
 def run_bullpen_positions(address: str = None, source: str = None) -> str:
-    """Executes the `bullpen polymarket positions` CLI command with timeout."""
+    """Executes the `bullpen polymarket positions` CLI command via shell execution."""
     bin_path = get_bullpen_binary_path()
-    cmd = [bin_path, "polymarket", "positions"]
+    cmd_parts = [bin_path, "polymarket", "positions"]
     if address:
-        cmd.extend(["--address", address])
+        cmd_parts.extend(["--address", address])
     if source:
-        cmd.extend(["--source", source])
+        cmd_parts.extend(["--source", source])
     
+    cmd_str = " ".join(cmd_parts)
+
     # Ensure PATH includes ~/.bullpen/bin
     env = os.environ.copy()
     bullpen_bin_dir = os.path.expanduser("~/.bullpen/bin")
@@ -119,19 +121,12 @@ def run_bullpen_positions(address: str = None, source: str = None) -> str:
         env["PATH"] = f"{bullpen_bin_dir}:{env.get('PATH', '')}"
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10, env=env)
+        res = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, check=True, timeout=10, env=env)
         return res.stdout.strip()
     except subprocess.TimeoutExpired:
         return "[Error] `bullpen` CLI command timed out after 10 seconds."
     except FileNotFoundError:
         return "[Error] `bullpen` CLI tool is not installed or not in PATH on this server."
-    except OSError as e:
-        if e.errno == 8: # Exec format error
-            return (
-                "[Error] Exec format error: `bullpen` binary architecture does not match server CPU architecture "
-                "(e.g. x86_64 binary installed on an ARM64 server or vice versa). Please check `uname -m`."
-            )
-        return f"[Error] OS Error executing `bullpen`: {e}"
     except subprocess.CalledProcessError as e:
         err_msg = e.stderr.strip() or e.stdout.strip()
         return f"[Bullpen Error] {err_msg}"
