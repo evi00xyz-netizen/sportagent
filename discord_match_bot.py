@@ -150,7 +150,7 @@ def run_bullpen_positions(address: str = None, source: str = None, json_mode: bo
         return f"[Error] Failed to execute bullpen CLI: {e}"
 
 def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
-    """Executes `bullpen polymarket sell <slug> <outcome> <shares>` to close position."""
+    """Executes `bullpen polymarket sell <slug> <outcome> <shares>` with automatic retry on CLI suggestions."""
     bin_path = get_bullpen_binary_path()
     cmd_parts = [bin_path, "polymarket", "sell", market_slug, outcome, str(shares)]
 
@@ -165,7 +165,21 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
     except subprocess.TimeoutExpired:
         return "[Error] `bullpen polymarket sell` command timed out."
     except subprocess.CalledProcessError as e:
-        err_out = e.stderr.strip() or e.stdout.strip()
+        err_out = (e.stderr.strip() or e.stdout.strip())
+
+        # Check if bullpen returned "Did you mean:" suggestions
+        suggested_slugs = re.findall(r'\(([^)]+)\)', err_out)
+        if suggested_slugs:
+            for suggested in suggested_slugs:
+                if "-" in suggested and suggested != market_slug:
+                    print(f"[Sell Retry] Retrying with suggested slug: {suggested}", file=sys.stderr)
+                    retry_parts = [bin_path, "polymarket", "sell", suggested, outcome, str(shares)]
+                    try:
+                        res_retry = subprocess.run(retry_parts, capture_output=True, text=True, check=True, timeout=15, env=env)
+                        return res_retry.stdout.strip()
+                    except Exception as retry_err:
+                        print(f"[Sell Retry Failed] {retry_err}", file=sys.stderr)
+
         return f"[Sell Error] Exit code {e.returncode}: {err_out}"
     except Exception as e:
         return f"[Sell Error] Failed to sell position: {e}"
