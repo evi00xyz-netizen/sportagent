@@ -37,7 +37,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 user_settings = {}
 
 def get_min_edge(guild_id: int) -> float:
-    return user_settings.get(guild_id, {}).get("min_edge", DEFAULT_DEFAULT_EDGE if 'DEFAULT_DEFAULT_EDGE' in globals() else DEFAULT_MIN_EDGE)
+    return user_settings.get(guild_id, {}).get("min_edge", DEFAULT_MIN_EDGE)
 
 def set_min_edge(guild_id: int, edge: float):
     if guild_id not in user_settings:
@@ -53,7 +53,8 @@ def load_watcher_config() -> dict:
         "source": None,
         "stop_loss": None,
         "interval": 2,
-        "notify_on_change": True,
+        "notify_on_change": False,
+        "sl_alert_fired": False,
         "last_positions": None
     }
     if os.path.exists(CONFIG_FILE):
@@ -76,7 +77,8 @@ def save_watcher_config(state: dict):
             "source": state.get("source"),
             "stop_loss": state.get("stop_loss"),
             "interval": state.get("interval", 2),
-            "notify_on_change": state.get("notify_on_change", True),
+            "notify_on_change": state.get("notify_on_change", False),
+            "sl_alert_fired": state.get("sl_alert_fired", False),
             "last_positions": state.get("last_positions")
         }
         with open(CONFIG_FILE, "w") as f:
@@ -150,12 +152,10 @@ async def bullpen_watcher_loop():
                     addr = bullpen_watch_state.get("address")
                     src = bullpen_watch_state.get("source")
                     sl = bullpen_watch_state.get("stop_loss")
-                    notify_change = bullpen_watch_state.get("notify_on_change", True)
                     last_pos = bullpen_watch_state.get("last_positions")
 
                     pos_output = await asyncio.to_thread(run_bullpen_positions, addr, src)
 
-                    # Do not trigger position change alerts or SL on CLI errors
                     if pos_output.startswith("[Error]") or pos_output.startswith("[Bullpen Error]"):
                         print(f"[Bullpen Watcher CLI Warning] {pos_output}", file=sys.stderr)
                     else:
@@ -170,22 +170,24 @@ async def bullpen_watcher_loop():
                                     break
 
                         if sl_triggered:
-                            embed = discord.Embed(
-                                title="🚨 BULLPEN STOP LOSS TRIGGERED",
-                                description=f"Stop Loss threshold of `{sl}%` reached/exceeded!",
-                                color=discord.Color.red()
-                            )
-                            embed.add_field(name="Current Positions", value=_trunc(f"```\n{pos_output}\n```"), inline=False)
-                            await channel.send(embed=embed)
-                        elif notify_change and last_pos and last_pos != pos_output:
-                            embed = discord.Embed(
-                                title="📊 Bullpen Positions Updated",
-                                description="Change detected in monitored positions:",
-                                color=discord.Color.blue()
-                            )
-                            embed.add_field(name="Latest Positions", value=_trunc(f"```\n{pos_output}\n```"), inline=False)
-                            await channel.send(embed=embed)
+                            # Send SL trigger notification ONLY ONCE per trigger event
+                            if not bullpen_watch_state.get("sl_alert_fired", False):
+                                embed = discord.Embed(
+                                    title="🚨 BULLPEN STOP LOSS TRIGGERED",
+                                    description=f"Stop Loss threshold of `{sl}%` reached/exceeded!",
+                                    color=discord.Color.red()
+                                )
+                                embed.add_field(name="Current Positions", value=_trunc(f"```\n{pos_output}\n```"), inline=False)
+                                await channel.send(embed=embed)
+                                bullpen_watch_state["sl_alert_fired"] = True
+                                save_watcher_config(bullpen_watch_state)
+                        else:
+                            # Reset SL alert trigger state if loss recovers or condition resolves
+                            if bullpen_watch_state.get("sl_alert_fired", False):
+                                bullpen_watch_state["sl_alert_fired"] = False
+                                save_watcher_config(bullpen_watch_state)
 
+                        # Silently track position changes without sending messages
                         if pos_output != last_pos:
                             bullpen_watch_state["last_positions"] = pos_output
                             save_watcher_config(bullpen_watch_state)
@@ -554,6 +556,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         bullpen_watch_state["source"] = src
         bullpen_watch_state["stop_loss"] = sl
         bullpen_watch_state["interval"] = max(1, interval)
+        bullpen_watch_state["sl_alert_fired"] = False
 
         save_watcher_config(bullpen_watch_state)
 
@@ -564,8 +567,8 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
             f"• Interval: `{interval}s`\n"
             f"• Address: `{addr or 'Default'}`\n"
             f"• Source: `{src or 'Default'}`\n"
-            f"• Stop Loss Trigger: `{sl_desc}`\n"
-            f"• Configuration saved to disk — will automatically resume across restarts."
+            f"• Stop Loss Trigger: `{sl_desc}` (fires once when triggered)\n"
+            f"• Silent monitoring mode active — position cards are only shown when explicitly requested (`!positions`)."
         )
         await ctx.send(msg)
         return
