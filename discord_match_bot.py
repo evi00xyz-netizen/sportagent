@@ -16,6 +16,7 @@ DEFAULT_MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
 SURPLUS_API_KEY  = os.getenv("SURPLUS_API_KEY")
 SURPLUS_BASE_URL = os.getenv("SURPLUS_API_URL", "https://api.surplusintelligence.ai/min30/v1")
 SURPLUS_MODEL    = os.getenv("SURPLUS_MODEL", "gpt-5.4")
+CONFIG_FILE      = "watcher_config.json"
 
 # discord embed field limit
 EMBED_FIELD_MAX = 1024
@@ -42,15 +43,45 @@ def set_min_edge(guild_id: int, edge: float):
     user_settings[guild_id]["min_edge"] = edge
 
 # ── bullpen CLI wrapper & watcher state ─────────────────────
-bullpen_watch_state = {
-    "active": False,
-    "channel_id": None,
-    "address": None,
-    "source": None,
-    "stop_loss": None,
-    "interval": 60,
-    "task": None
-}
+def load_watcher_config() -> dict:
+    defaults = {
+        "active": False,
+        "channel_id": None,
+        "address": None,
+        "source": None,
+        "stop_loss": None,
+        "interval": 60,
+        "notify_on_change": True,
+        "last_positions": None
+    }
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                saved = json.load(f)
+                defaults.update(saved)
+        except Exception as e:
+            print(f"[Config Load Error] {e}", file=sys.stderr)
+    return defaults
+
+def save_watcher_config(state: dict):
+    try:
+        to_save = {
+            "active": state.get("active", False),
+            "channel_id": state.get("channel_id"),
+            "address": state.get("address"),
+            "source": state.get("source"),
+            "stop_loss": state.get("stop_loss"),
+            "interval": state.get("interval", 60),
+            "notify_on_change": state.get("notify_on_change", True),
+            "last_positions": state.get("last_positions")
+        }
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(to_save, f, indent=2)
+    except Exception as e:
+        print(f"[Config Save Error] {e}", file=sys.stderr)
+
+bullpen_watch_state = load_watcher_config()
+bullpen_watch_state["task"] = None
 
 def run_bullpen_positions(address: str = None, source: str = None) -> str:
     """Executes the `bullpen polymarket positions` CLI command."""
@@ -70,21 +101,23 @@ def run_bullpen_positions(address: str = None, source: str = None) -> str:
         return f"[Bullpen Error] {err_msg}"
 
 async def bullpen_watcher_loop():
-    """Background task constantly polling bullpen positions and checking Stop Loss / changes."""
+    """Background task continuously monitoring bullpen positions 24/7 across restarts."""
     while True:
         try:
             if bullpen_watch_state["active"] and bullpen_watch_state["channel_id"]:
                 channel = bot.get_channel(bullpen_watch_state["channel_id"])
                 if channel:
-                    addr = bullpen_watch_state["address"]
-                    src = bullpen_watch_state["source"]
-                    sl = bullpen_watch_state["stop_loss"]
+                    addr = bullpen_watch_state.get("address")
+                    src = bullpen_watch_state.get("source")
+                    sl = bullpen_watch_state.get("stop_loss")
+                    notify_change = bullpen_watch_state.get("notify_on_change", True)
+                    last_pos = bullpen_watch_state.get("last_positions")
 
                     pos_output = await asyncio.to_thread(run_bullpen_positions, addr, src)
                     
+                    # Stop loss check
                     sl_triggered = False
                     if sl is not None:
-                        # Scan output for numeric percentage loss metrics if available
                         matches = re.findall(r"-\d+(?:\.\d+)?%", pos_output)
                         for m in matches:
                             loss_val = abs(float(m.replace("%", "")))
@@ -100,6 +133,18 @@ async def bullpen_watcher_loop():
                         )
                         embed.add_field(name="Current Positions", value=_trunc(f"```\n{pos_output}\n```"), inline=False)
                         await channel.send(embed=embed)
+                    elif notify_change and last_pos and last_pos != pos_output:
+                        embed = discord.Embed(
+                            title="📊 Bullpen Positions Updated",
+                            description="Change detected in monitored positions:",
+                            color=discord.Color.blue()
+                        )
+                        embed.add_field(name="Latest Positions", value=_trunc(f"```\n{pos_output}\n```"), inline=False)
+                        await channel.send(embed=embed)
+
+                    if pos_output != last_pos:
+                        bullpen_watch_state["last_positions"] = pos_output
+                        save_watcher_config(bullpen_watch_state)
 
         except Exception as e:
             print(f"[Bullpen Watcher Error] {e}", file=sys.stderr)
@@ -402,7 +447,7 @@ async def cmd_positions(ctx, *, args: str = ""):
 
 @bot.command(name="watchbullpen")
 async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
-    """Start/stop watching bullpen positions with optional stop-loss trigger.
+    """Start/stop watching bullpen positions 24/7 with optional stop-loss trigger.
     Usage:
       !watchbullpen start [--address 0x...] [--source bullpen|polymarket] [--sl 15] [--interval 60]
       !watchbullpen stop
@@ -413,17 +458,18 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
 
     if act == "stop":
         bullpen_watch_state["active"] = False
+        save_watcher_config(bullpen_watch_state)
         await ctx.send("🛑 Stopped watching Bullpen positions.")
         return
 
     if act == "status":
         status_str = (
-            f"**Status:** {'🟢 Active' if bullpen_watch_state['active'] else '🔴 Stopped'}\n"
-            f"**Channel:** <#{bullpen_watch_state['channel_id']}>\n"
-            f"**Address:** `{bullpen_watch_state['address'] or 'Default'}`\n"
-            f"**Source:** `{bullpen_watch_state['source'] or 'Default'}`\n"
-            f"**Stop Loss:** `{f'{bullpen_watch_state[\"stop_loss\"]}%' if bullpen_watch_state['stop_loss'] else 'None'}`\n"
-            f"**Interval:** `{bullpen_watch_state['interval']}s`"
+            f"**Status:** {'🟢 Active (24/7 Monitoring)' if bullpen_watch_state.get('active') else '🔴 Stopped'}\n"
+            f"**Channel:** <#{bullpen_watch_state.get('channel_id') or 'None'}>\n"
+            f"**Address:** `{bullpen_watch_state.get('address') or 'Default'}`\n"
+            f"**Source:** `{bullpen_watch_state.get('source') or 'Default'}`\n"
+            f"**Stop Loss:** `{f'{bullpen_watch_state.get(\"stop_loss\")}%' if bullpen_watch_state.get('stop_loss') else 'None'}`\n"
+            f"**Interval:** `{bullpen_watch_state.get('interval', 60)}s`"
         )
         await ctx.send(embed=discord.Embed(title="Bullpen Watcher Status", description=status_str, color=discord.Color.blue()))
         return
@@ -454,12 +500,15 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         bullpen_watch_state["stop_loss"] = sl
         bullpen_watch_state["interval"] = interval
 
+        save_watcher_config(bullpen_watch_state)
+
         msg = (
-            f"🟢 **Started watching Bullpen positions in this channel!**\n"
+            f"🟢 **Started 24/7 background watching of Bullpen positions in this channel!**\n"
             f"• Interval: `{interval}s`\n"
             f"• Address: `{addr or 'Default'}`\n"
             f"• Source: `{src or 'Default'}`\n"
-            f"• Stop Loss Trigger: `{f'{sl}%' if sl else 'Disabled'}`"
+            f"• Stop Loss Trigger: `{f'{sl}%' if sl else 'Disabled'}`\n"
+            f"• Configuration saved to disk — will automatically resume across restarts."
         )
         await ctx.send(msg)
         return
@@ -612,8 +661,10 @@ async def on_command_error(ctx, error):
 async def on_ready():
     print(f"online: {bot.user.name} ({bot.user.id})")
     print(f"model: {SURPLUS_MODEL}  |  base_url: {SURPLUS_BASE_URL}")
-    if bullpen_watch_state["task"] is None:
+    if bullpen_watch_state.get("task") is None:
         bullpen_watch_state["task"] = asyncio.create_task(bullpen_watcher_loop())
+    if bullpen_watch_state.get("active"):
+        print(f"[INFO] bullpen watcher auto-started from config for channel {bullpen_watch_state.get('channel_id')}")
 
 @bot.event
 async def on_disconnect():
