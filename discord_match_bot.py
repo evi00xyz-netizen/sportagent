@@ -51,7 +51,7 @@ def load_watcher_config() -> dict:
         "address": None,
         "source": None,
         "stop_loss": None,
-        "interval": 1,
+        "interval": 2,
         "notify_on_change": True,
         "last_positions": None
     }
@@ -74,7 +74,7 @@ def save_watcher_config(state: dict):
             "address": state.get("address"),
             "source": state.get("source"),
             "stop_loss": state.get("stop_loss"),
-            "interval": state.get("interval", 1),
+            "interval": state.get("interval", 2),
             "notify_on_change": state.get("notify_on_change", True),
             "last_positions": state.get("last_positions")
         }
@@ -87,7 +87,7 @@ bullpen_watch_state = load_watcher_config()
 bullpen_watch_state["task"] = None
 
 def run_bullpen_positions(address: str = None, source: str = None) -> str:
-    """Executes the `bullpen polymarket positions` CLI command."""
+    """Executes the `bullpen polymarket positions` CLI command with timeout."""
     cmd = ["bullpen", "polymarket", "positions"]
     if address:
         cmd.extend(["--address", address])
@@ -95,8 +95,10 @@ def run_bullpen_positions(address: str = None, source: str = None) -> str:
         cmd.extend(["--source", source])
     
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
         return res.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return "[Error] `bullpen` CLI command timed out after 10 seconds."
     except FileNotFoundError:
         return "[Error] `bullpen` CLI tool is not installed or not in PATH on this server."
     except subprocess.CalledProcessError as e:
@@ -119,41 +121,45 @@ async def bullpen_watcher_loop():
 
                     pos_output = await asyncio.to_thread(run_bullpen_positions, addr, src)
                     
-                    # Stop loss check
-                    sl_triggered = False
-                    if sl is not None:
-                        matches = re.findall(r"-\d+(?:\.\d+)?%", pos_output)
-                        for m in matches:
-                            loss_val = abs(float(m.replace("%", "")))
-                            if loss_val >= sl:
-                                sl_triggered = True
-                                break
+                    # Do not trigger position change alerts or SL on CLI errors
+                    if pos_output.startswith("[Error]") or pos_output.startswith("[Bullpen Error]"):
+                        print(f"[Bullpen Watcher CLI Warning] {pos_output}", file=sys.stderr)
+                    else:
+                        # Stop loss check
+                        sl_triggered = False
+                        if sl is not None:
+                            matches = re.findall(r"-\d+(?:\.\d+)?%", pos_output)
+                            for m in matches:
+                                loss_val = abs(float(m.replace("%", "")))
+                                if loss_val >= sl:
+                                    sl_triggered = True
+                                    break
 
-                    if sl_triggered:
-                        embed = discord.Embed(
-                            title="🚨 BULLPEN STOP LOSS TRIGGERED",
-                            description=f"Stop Loss threshold of `{sl}%` reached/exceeded!",
-                            color=discord.Color.red()
-                        )
-                        embed.add_field(name="Current Positions", value=_trunc(f"```\n{pos_output}\n```"), inline=False)
-                        await channel.send(embed=embed)
-                    elif notify_change and last_pos and last_pos != pos_output:
-                        embed = discord.Embed(
-                            title="📊 Bullpen Positions Updated",
-                            description="Change detected in monitored positions:",
-                            color=discord.Color.blue()
-                        )
-                        embed.add_field(name="Latest Positions", value=_trunc(f"```\n{pos_output}\n```"), inline=False)
-                        await channel.send(embed=embed)
+                        if sl_triggered:
+                            embed = discord.Embed(
+                                title="🚨 BULLPEN STOP LOSS TRIGGERED",
+                                description=f"Stop Loss threshold of `{sl}%` reached/exceeded!",
+                                color=discord.Color.red()
+                            )
+                            embed.add_field(name="Current Positions", value=_trunc(f"```\n{pos_output}\n```"), inline=False)
+                            await channel.send(embed=embed)
+                        elif notify_change and last_pos and last_pos != pos_output:
+                            embed = discord.Embed(
+                                title="📊 Bullpen Positions Updated",
+                                description="Change detected in monitored positions:",
+                                color=discord.Color.blue()
+                            )
+                            embed.add_field(name="Latest Positions", value=_trunc(f"```\n{pos_output}\n```"), inline=False)
+                            await channel.send(embed=embed)
 
-                    if pos_output != last_pos:
-                        bullpen_watch_state["last_positions"] = pos_output
-                        save_watcher_config(bullpen_watch_state)
+                        if pos_output != last_pos:
+                            bullpen_watch_state["last_positions"] = pos_output
+                            save_watcher_config(bullpen_watch_state)
 
         except Exception as e:
-            print(f"[Bullpen Watcher Error] {e}", file=sys.stderr)
+            print(f"[Bullpen Watcher Loop Error] {e}", file=sys.stderr)
 
-        interval = bullpen_watch_state.get("interval", 1)
+        interval = max(1, bullpen_watch_state.get("interval", 2))
         await asyncio.sleep(interval)
 
 # ── sport detection ─────────────────────────────────────────
@@ -194,10 +200,10 @@ TEAM_SPORT_MAP = {
     "hurricanes": "nhl", "blue jackets": "nhl", "devils": "nhl", "islanders": "nhl",
     "rangers": "nhl", "flyers": "nhl", "penguins": "nhl",
     "blackhawks": "nhl", "avalanche": "nhl", "stars": "nhl", "wild": "nhl",
-    "predators": "nhl", "blues": "nhl", "jets": "nhl",
-    "ducks": "nhl", "flames": "nhl", "oilers": "nhl", "kings": "nhl",
-    "sharks": "nhl", "kraken": "nhl", "canucks": "nhl", "golden knights": "nhl",
-    "capitals": "nhl", "coyotes": "nhl",
+    "predators": "nhl", "blues": "nhl", "jets": "nhl", "ducks": "nhl",
+    "flames": "nhl", "oilers": "nhl", "kings": "nhl", "sharks": "nhl",
+    "kraken": "nhl", "canucks": "nhl", "golden knights": "nhl", "capitals": "nhl",
+    "coyotes": "nhl",
 }
 
 def detect_sport(match_query: str) -> str:
@@ -453,7 +459,7 @@ async def cmd_positions(ctx, *, args: str = ""):
 async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
     """Start/stop watching bullpen positions 24/7 with optional stop-loss trigger.
     Usage:
-      !watchbullpen start [--address 0x...] [--source bullpen|polymarket] [--sl 15] [--interval 1] [--channel <id>]
+      !watchbullpen start [--address 0x...] [--source bullpen|polymarket] [--sl 15] [--interval 2] [--channel <id>]
       !watchbullpen stop
       !watchbullpen status
     """
@@ -474,7 +480,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
             f"**Address:** `{bullpen_watch_state.get('address') or 'Default'}`\n"
             f"**Source:** `{bullpen_watch_state.get('source') or 'Default'}`\n"
             f"**Stop Loss:** `{f'{bullpen_watch_state.get(\"stop_loss\")}%' if bullpen_watch_state.get('stop_loss') else 'None'}`\n"
-            f"**Interval:** `{bullpen_watch_state.get('interval', 1)}s`"
+            f"**Interval:** `{bullpen_watch_state.get('interval', 2)}s`"
         )
         await ctx.send(embed=discord.Embed(title="Bullpen Watcher Status", description=status_str, color=discord.Color.blue()))
         return
@@ -483,7 +489,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         addr = None
         src = None
         sl = None
-        interval = 1
+        interval = 2
         target_ch = MONITOR_CHANNEL_ID
 
         if "--channel" in args:
@@ -510,7 +516,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         bullpen_watch_state["address"] = addr
         bullpen_watch_state["source"] = src
         bullpen_watch_state["stop_loss"] = sl
-        bullpen_watch_state["interval"] = interval
+        bullpen_watch_state["interval"] = max(1, interval)
 
         save_watcher_config(bullpen_watch_state)
 
@@ -675,7 +681,7 @@ async def on_ready():
     print(f"online: {bot.user.name} ({bot.user.id})")
     print(f"model: {SURPLUS_MODEL}  |  base_url: {SURPLUS_BASE_URL}")
     if bullpen_watch_state.get("task") is None:
-        bullpen_watch_state["task"] = asyncio.create_task(bullpen_watcher_loop())
+        bullpen_watch_state["task"] = asyncio.io_task = asyncio.create_task(bullpen_watcher_loop())
     if bullpen_watch_state.get("active"):
         target_ch = bullpen_watch_state.get('channel_id') or MONITOR_CHANNEL_ID
         print(f"[INFO] bullpen watcher auto-started from config for channel {target_ch}")
