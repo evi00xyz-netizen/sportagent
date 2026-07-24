@@ -65,6 +65,22 @@ REQUIRED_KEYS = {
 PROB_KEYS = {"home_win", "draw", "away_win"}
 FACTOR_KEYS = {"home_form", "away_form", "home_absences", "away_absences", "tactical_edge"}
 
+def _extract_braced(text: str) -> str:
+    """find first { and matching } via depth counting."""
+    start = text.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1]
+    return None
+
 def extract_json(raw: str) -> str:
     """aggressive json extraction — handles every llm output format."""
     if not raw:
@@ -78,38 +94,31 @@ def extract_json(raw: str) -> str:
     if m:
         inner = m.group(1).strip()
         if inner:
-            return _find_braces(inner, raw)
+            braced = _extract_braced(inner)
+            if braced:
+                return braced
+            # fall through — maybe the inner content is unbraced json fields
 
-    # case 2: look for json object { ... }
-    return _find_braces(raw, raw)
+    # case 2: has opening brace — extract it
+    braced = _extract_braced(raw)
+    if braced:
+        return braced
 
-def _find_braces(text: str, fallback_raw: str) -> str:
-    """find first { and matching } and return the substring."""
-    start = text.find('{')
-    if start == -1:
-        raise ValueError(
-            f"no opening brace in llm response. raw (first 500 chars): {fallback_raw[:500]}"
-        )
+    # case 3: no braces — model returned bare key:value pairs. wrap in {}
+    # this happens with some models that strip the outer braces
+    bare = raw.strip()
+    if bare.startswith('"'):
+        wrapped = "{" + bare + "}"
+        # verify it has a closing by checking if wrapping makes sense
+        if wrapped.count('{') == wrapped.count('}'):
+            return wrapped
 
-    # walk forward counting braces to find matching closing }
-    depth = 0
-    end = -1
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0:
-                end = i
-                break
-
-    if end == -1:
-        raise ValueError(
-            f"unmatched braces in llm response. raw (first 500 chars): {fallback_raw[:500]}"
-        )
-
-    return text[start:end+1]
+    # nothing worked — diagnostic info
+    snippet = raw[:500]
+    raise ValueError(
+        f"cannot extract json from llm response. "
+        f"first 500 chars: {snippet}"
+    )
 
 def validate_llm_output(data: dict) -> dict:
     """strict output validation — raises on schema violation."""
@@ -137,9 +146,16 @@ def validate_llm_output(data: dict) -> dict:
     return data
 
 def parse_llm_response(raw: str) -> dict:
-    """extract json from llm response and validate it. returns the raw string on failure so caller can log it."""
+    """extract json from llm response and validate it."""
     json_str = extract_json(raw)
-    data = json.loads(json_str)
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"invalid json from llm: {e}\n"
+            f"extracted (first 500 chars): {json_str[:500]}\n"
+            f"raw (first 500 chars): {raw[:500]}"
+        )
     return validate_llm_output(data)
 
 # ── api client ──────────────────────────────────────────────
@@ -232,7 +248,6 @@ async def cmd_match(ctx, *, args: str):
         try:
             data = await fetch_true_probabilities(match_query)
         except Exception as e:
-            # include the full error so we can debug
             await ctx.send(f"**error**: {e}")
             return
 
