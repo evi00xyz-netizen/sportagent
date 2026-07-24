@@ -112,7 +112,8 @@ SYSTEM_PROMPT = (
     "You are a sports probability matrix engine. "
     "Output ONLY valid JSON. Do not include markdown, code blocks, or any text outside the JSON. "
     "Never reference betting odds, bookmaker lines, or market prices. "
-    "Base probabilities solely on fundamental match data."
+    "Base probabilities solely on fundamental match data. "
+    "BE CONCISE: every string value must be 1 short sentence or phrase — never paragraphs."
 )
 
 USER_PROMPT_TEMPLATE = (
@@ -136,7 +137,12 @@ USER_PROMPT_TEMPLATE = (
     '  "confidence": float\n'
     "}}\n"
     "{draw_rule}"
-    "home_win+draw+away_win MUST sum to 1.0."
+    "home_win+draw+away_win MUST sum to 1.0.\n"
+    "RULES:\n"
+    "- Every string value must be 1 short sentence or phrase. NEVER write paragraphs.\n"
+    "- forecast: 1 sentence max, 15 words max.\n"
+    "- form/absences/tactical_edge: 1 phrase each, 8 words max.\n"
+    "- match_name/home_team/away_team: team names only, no extra words."
 )
 
 def build_user_prompt(match_query: str) -> str:
@@ -258,7 +264,7 @@ async def fetch_true_probabilities(match_query: str) -> dict:
             {"role": "user",   "content": user_prompt}
         ],
         temperature=0.1,
-        max_tokens=4000,
+        max_tokens=2000,
     )
     msg = response.choices[0].message
     raw = msg.content or ""
