@@ -173,9 +173,10 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
 _slug_cache = {}
 
 def to_slug(text: str) -> str:
-    """Converts a market question string into a basic slug."""
+    """Converts a market question string into a clean slug, collapsing multiple hyphens."""
     s = text.lower().replace("…", "").replace("...", "").replace(" ", "-")
     s = re.sub(r'[^a-z0-9\-]+', '-', s)
+    s = re.sub(r'-+', '-', s)
     return s.strip('-')
 
 def resolve_exact_slug(market_title: str) -> str:
@@ -252,7 +253,7 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
                 raw_slug = item.get("marketSlug") or item.get("slug") or item.get("eventSlug")
 
                 if raw_slug and isinstance(raw_slug, str) and not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug and len(raw_slug.strip()) > 0:
-                    m_slug = raw_slug.strip()
+                    m_slug = re.sub(r'-+', '-', raw_slug.strip())
                 else:
                     m_slug = resolve_exact_slug(title)
 
