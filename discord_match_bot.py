@@ -142,6 +142,71 @@ def run_bullpen_positions(address: str = None, source: str = None) -> str:
     except Exception as e:
         return f"[Error] Failed to execute bullpen CLI: {e}"
 
+def format_positions_mobile(raw_output: str) -> str:
+    """Parses wide CLI table output into clean vertical cards ideal for mobile Discord display."""
+    if not raw_output or raw_output.startswith("[Error]") or raw_output.startswith("[Bullpen Error]"):
+        return f"```\n{raw_output}\n```"
+
+    lines = raw_output.splitlines()
+    summary_line = ""
+    source_line = ""
+    table_started = False
+    position_lines = []
+
+    for line in lines:
+        l = line.strip()
+        if not l:
+            continue
+        if l.startswith("Positions ("):
+            summary_line = l
+        elif l.startswith("Source:"):
+            source_line = l
+        elif l.startswith("---"):
+            table_started = True
+        elif table_started:
+            position_lines.append(l)
+
+    formatted_blocks = []
+
+    if summary_line:
+        formatted_blocks.append(f"📊 **{summary_line}**")
+    if source_line:
+        formatted_blocks.append(f"• _{source_line}_")
+
+    if position_lines:
+        formatted_blocks.append("")
+        for pos in position_lines:
+            tokens = pos.split()
+            if len(tokens) >= 9:
+                roe = tokens[-1]
+                pnl = tokens[-2]
+                val = tokens[-3]
+                now = tokens[-4]
+                entry = tokens[-5]
+                shares = tokens[-6]
+                status = tokens[-7]
+                outcome = tokens[-8]
+                market = " ".join(tokens[:-8])
+
+                pnl_emoji = "🔴" if "-" in pnl or "-" in roe else "🟢"
+
+                card = (
+                    f"📌 **{market}**\n"
+                    f"• Outcome: **{outcome}** | Status: `{status}`\n"
+                    f"• Shares: `{shares}` | Value: `{val}`\n"
+                    f"• Entry: `{entry}` ➔ Now: `{now}`\n"
+                    f"• P&L: {pnl_emoji} `{pnl}` (`{roe}`)"
+                )
+                formatted_blocks.append(card)
+            else:
+                formatted_blocks.append(f"`{pos}`")
+    elif "No open positions" in raw_output or "0 open" in raw_output:
+        formatted_blocks.append("\n_No open positions found._")
+    else:
+        return f"```\n{_trunc(raw_output, 2000)}\n```"
+
+    return "\n".join(formatted_blocks)
+
 async def bullpen_watcher_loop():
     """Background task continuously monitoring bullpen positions 24/7 across restarts."""
     global last_periodic_time
@@ -173,6 +238,8 @@ async def bullpen_watcher_loop():
                                     sl_triggered = True
                                     break
 
+                        mobile_text = format_positions_mobile(pos_output)
+
                         if sl_triggered:
                             if not bullpen_watch_state.get("sl_alert_fired", False):
                                 embed = discord.Embed(
@@ -180,7 +247,7 @@ async def bullpen_watcher_loop():
                                     description=f"Stop Loss threshold of `{sl}%` reached/exceeded!",
                                     color=discord.Color.red()
                                 )
-                                embed.add_field(name="Current Positions", value=_trunc(f"```\n{pos_output}\n```"), inline=False)
+                                embed.add_field(name="Current Positions", value=_trunc(mobile_text, 1024), inline=False)
                                 await channel.send(embed=embed)
                                 bullpen_watch_state["sl_alert_fired"] = True
                                 save_watcher_config(bullpen_watch_state)
@@ -193,7 +260,7 @@ async def bullpen_watcher_loop():
                         if last_periodic_time == 0 or (now - last_periodic_time) >= periodic_interval:
                             embed = discord.Embed(
                                 title="📊 Bullpen 5-Min Position Report",
-                                description=f"```\n{_trunc(pos_output, 2000)}\n```",
+                                description=_trunc(mobile_text, 4000),
                                 color=discord.Color.blue()
                             )
                             await channel.send(embed=embed)
@@ -489,10 +556,11 @@ async def cmd_open(ctx, *, args: str = ""):
                 src = m.group(1)
 
         output = await asyncio.to_thread(run_bullpen_positions, addr, src)
+        mobile_formatted = format_positions_mobile(output)
 
         embed = discord.Embed(
             title="Bullpen Polymarket Positions",
-            description=f"```\n{_trunc(output, 2000)}\n```",
+            description=_trunc(mobile_formatted, 4000),
             color=discord.Color.gold()
         )
         if addr:
