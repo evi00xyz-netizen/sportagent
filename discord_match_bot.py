@@ -193,29 +193,67 @@ def to_slug(text: str) -> str:
     s = re.sub(r'-+', '-', s)
     return s.strip('-')
 
-def resolve_exact_slug(market_title: str, outcome: str = None) -> str:
-    """Resolves exact Polymarket marketSlug directly from title and outcome without broken Gamma search queries."""
-    cache_key = f"{market_title}:{outcome}" if outcome else market_title
-    if cache_key in _slug_cache:
-        return _slug_cache[cache_key]
+def fetch_exact_slug_by_asset(asset_id_or_condition: str) -> str:
+    """Queries Polymarket Gamma API by asset/condition ID to retrieve the official marketSlug or event slug."""
+    if not asset_id_or_condition:
+        return None
+    if asset_id_or_condition in _slug_cache:
+        return _slug_cache[asset_id_or_condition]
 
-    clean_title = market_title.replace("…", "").replace("...", "").strip()
-    if not clean_title:
-        return "unknown-market"
+    try:
+        url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={asset_id_or_condition}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                if isinstance(data, list) and len(data) > 0:
+                    m = data[0]
+                    exact_slug = m.get("marketSlug") or m.get("slug")
+                    if exact_slug:
+                        clean_slug = re.sub(r'-+', '-', exact_slug.strip())
+                        _slug_cache[asset_id_or_condition] = clean_slug
+                        return clean_slug
+    except Exception as e:
+        print(f"[Asset Lookup Error] {e}", file=sys.stderr)
 
-    # Direct title slugification
-    fallback_slug = to_slug(clean_title)
+    try:
+        url = f"https://gamma-api.polymarket.com/markets?condition_id={asset_id_or_condition}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                if isinstance(data, list) and len(data) > 0:
+                    m = data[0]
+                    exact_slug = m.get("marketSlug") or m.get("slug")
+                    if exact_slug:
+                        clean_slug = re.sub(r'-+', '-', exact_slug.strip())
+                        _slug_cache[asset_id_or_condition] = clean_slug
+                        return clean_slug
+    except Exception as e:
+        print(f"[Condition Lookup Error] {e}", file=sys.stderr)
 
-    # Handle sports vs/at matches if outcome is a team name and title is truncated or team-focused
-    if outcome and outcome.lower() not in ("yes", "no"):
-        out_lower = outcome.lower()
-        if "vs" in clean_title.lower() or "at" in clean_title.lower():
-            # e.g. "Los Angeles Dodgers vs ..." with outcome "Dodgers"
-            full_text = f"{clean_title} {outcome}"
-            fallback_slug = to_slug(full_text)
+    return None
 
-    _slug_cache[cache_key] = fallback_slug
-    return fallback_slug
+def resolve_exact_slug(market_title: str, item_dict: dict = None) -> str:
+    """Resolves exact Polymarket marketSlug directly from item IDs, or clean fallback string."""
+    clean_title = market_title.replace("…", "").replace("...", "").strip() if market_title else ""
+
+    if item_dict and isinstance(item_dict, dict):
+        # 1. Check direct raw fields from Bullpen JSON
+        raw_slug = item_dict.get("marketSlug") or item_dict.get("slug") or item_dict.get("eventSlug")
+        if raw_slug and isinstance(raw_slug, str) and len(raw_slug.strip()) > 0:
+            if not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug:
+                return re.sub(r'-+', '-', raw_slug.strip())
+
+        # 2. Query Gamma API by asset/token ID or condition ID if present
+        asset_id = item_dict.get("asset_id") or item_dict.get("assetId") or item_dict.get("tokenId") or item_dict.get("conditionId")
+        if asset_id:
+            exact_by_id = fetch_exact_slug_by_asset(str(asset_id))
+            if exact_by_id:
+                return exact_by_id
+
+    # Fallback to direct title slug
+    return to_slug(clean_title) if clean_title else "unknown-market"
 
 def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
     """Parses CLI output (JSON or table) into header text and individual position objects."""
@@ -231,13 +269,8 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
             for item in data:
                 title = item.get("title") or item.get("market") or item.get("question") or "Unknown Market"
                 outcome = item.get("outcome") or item.get("outcomeName") or "Yes"
-                raw_slug = item.get("marketSlug") or item.get("slug") or item.get("eventSlug")
 
-                # If raw_slug is present and valid (not truncated or missing), use it directly
-                if raw_slug and isinstance(raw_slug, str) and not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug and len(raw_slug.strip()) > 0:
-                    m_slug = re.sub(r'-+', '-', raw_slug.strip())
-                else:
-                    m_slug = resolve_exact_slug(title, outcome)
+                m_slug = resolve_exact_slug(title, item)
 
                 status = item.get("status", "open")
                 shares = str(item.get("shares") or item.get("size") or "0")
@@ -324,7 +357,7 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
                 status = tokens[-7]
                 outcome = tokens[-8]
                 market = " ".join(tokens[:-8])
-                slug = resolve_exact_slug(market, outcome)
+                slug = resolve_exact_slug(market)
 
                 parsed_positions.append({
                     "raw": pos,
