@@ -193,72 +193,28 @@ def to_slug(text: str) -> str:
     s = re.sub(r'-+', '-', s)
     return s.strip('-')
 
-def resolve_exact_slug(market_title: str) -> str:
-    """Resolves exact Polymarket marketSlug for truncated titles or sports events via Gamma API search endpoints."""
-    if not market_title:
-        return "unknown-market"
-
-    if market_title in _slug_cache:
-        return _slug_cache[market_title]
+def resolve_exact_slug(market_title: str, outcome: str = None) -> str:
+    """Resolves exact Polymarket marketSlug directly from title and outcome without broken Gamma search queries."""
+    cache_key = f"{market_title}:{outcome}" if outcome else market_title
+    if cache_key in _slug_cache:
+        return _slug_cache[cache_key]
 
     clean_title = market_title.replace("…", "").replace("...", "").strip()
     if not clean_title:
         return "unknown-market"
 
+    # Direct title slugification
     fallback_slug = to_slug(clean_title)
 
-    try:
-        query_words = [w for w in re.split(r'\W+', clean_title.lower()) if len(w) > 2]
-        search_query = " ".join(query_words[:4]) if query_words else clean_title
+    # Handle sports vs/at matches if outcome is a team name and title is truncated or team-focused
+    if outcome and outcome.lower() not in ("yes", "no"):
+        out_lower = outcome.lower()
+        if "vs" in clean_title.lower() or "at" in clean_title.lower():
+            # e.g. "Los Angeles Dodgers vs ..." with outcome "Dodgers"
+            full_text = f"{clean_title} {outcome}"
+            fallback_slug = to_slug(full_text)
 
-        q = urllib.parse.quote(search_query)
-        url = f"https://gamma-api.polymarket.com/events?search={q}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        with urllib.request.urlopen(req, timeout=4) as response:
-            if response.status == 200:
-                data = json.loads(response.read().decode('utf-8'))
-                if isinstance(data, list) and len(data) > 0:
-                    clean_lower = clean_title.lower()
-                    words = [w for w in re.split(r'\W+', clean_lower) if len(w) > 2]
-
-                    best_slug = None
-                    best_match_count = 0
-
-                    for ev in data:
-                        if not isinstance(ev, dict):
-                            continue
-                        ev_title = (ev.get("title") or "").lower()
-                        ev_slug = ev.get("slug") or ev.get("eventSlug") or ev.get("ticker")
-
-                        markets = ev.get("markets") or []
-                        for m in markets:
-                            if not isinstance(m, dict):
-                                continue
-                            m_question = (m.get("question") or m.get("title") or "").lower()
-                            m_slug = m.get("marketSlug") or m.get("slug") or ev_slug
-
-                            if not m_slug:
-                                continue
-
-                            match_count = sum(1 for w in words if w in m_question or w in ev_title or w in m_slug)
-                            if match_count > best_match_count:
-                                best_match_count = match_count
-                                best_slug = m_slug
-
-                        if ev_slug and not best_slug:
-                            match_count = sum(1 for w in words if w in ev_title or w in ev_slug)
-                            if match_count > best_match_count:
-                                best_match_count = match_count
-                                best_slug = ev_slug
-
-                    if best_slug and best_match_count >= max(1, len(words) // 3):
-                        clean_best = re.sub(r'-+', '-', best_slug.strip())
-                        _slug_cache[market_title] = clean_best
-                        return clean_best
-    except Exception as e:
-        print(f"[Slug Resolve Warning] Gamma API lookup error for '{market_title}': {e}", file=sys.stderr)
-
-    _slug_cache[market_title] = fallback_slug
+    _slug_cache[cache_key] = fallback_slug
     return fallback_slug
 
 def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
@@ -274,15 +230,15 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
             total_pnl = 0.0
             for item in data:
                 title = item.get("title") or item.get("market") or item.get("question") or "Unknown Market"
+                outcome = item.get("outcome") or item.get("outcomeName") or "Yes"
                 raw_slug = item.get("marketSlug") or item.get("slug") or item.get("eventSlug")
 
                 # If raw_slug is present and valid (not truncated or missing), use it directly
                 if raw_slug and isinstance(raw_slug, str) and not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug and len(raw_slug.strip()) > 0:
                     m_slug = re.sub(r'-+', '-', raw_slug.strip())
                 else:
-                    m_slug = resolve_exact_slug(title)
+                    m_slug = resolve_exact_slug(title, outcome)
 
-                outcome = item.get("outcome") or item.get("outcomeName") or "Yes"
                 status = item.get("status", "open")
                 shares = str(item.get("shares") or item.get("size") or "0")
 
@@ -368,7 +324,7 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
                 status = tokens[-7]
                 outcome = tokens[-8]
                 market = " ".join(tokens[:-8])
-                slug = resolve_exact_slug(market)
+                slug = resolve_exact_slug(market, outcome)
 
                 parsed_positions.append({
                     "raw": pos,
@@ -1122,7 +1078,7 @@ async def on_ready():
     print(f"online: {bot.user.name} ({bot.user.id})")
     print(f"model: {SURPLUS_MODEL}  |  base_url: {SURPLUS_BASE_URL}")
     if bullpen_watch_state.get("task") is None:
-        bullpen_watch_state["task"] = asyncio.task = asyncio.create_task(bullpen_watcher_loop())
+        bullpen_watch_state["task"] = asyncio.create_task(bullpen_watcher_loop())
     if bullpen_watch_state.get("active"):
         target_ch = bullpen_watch_state.get('channel_id') or MONITOR_CHANNEL_ID
         print(f"[INFO] bullpen watcher auto-started from config for channel {target_ch}")
