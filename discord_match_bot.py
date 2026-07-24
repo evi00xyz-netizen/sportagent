@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import discord
 from discord.ext import commands
 from openai import AsyncOpenAI
@@ -66,6 +67,23 @@ REQUIRED_KEYS = {
 PROB_KEYS = {"home_win", "draw", "away_win"}
 FACTOR_KEYS = {"home_form", "away_form", "home_absences", "away_absences", "tactical_edge"}
 
+def extract_json(raw: str) -> str:
+    """robust json extraction from llm output — handles markdown code blocks, stray text, and raw json."""
+    raw = raw.strip()
+
+    # try markdown code block: ```json ... ```
+    m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    # try to find first { and last }
+    start = raw.find('{')
+    end = raw.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        return raw[start:end+1]
+
+    return raw
+
 def validate_llm_output(data: dict) -> dict:
     """strict output validation — raises on schema violation."""
     missing = REQUIRED_KEYS - set(data.keys())
@@ -91,6 +109,15 @@ def validate_llm_output(data: dict) -> dict:
 
     return data
 
+def parse_llm_response(raw: str) -> dict:
+    """extract json from llm response and validate it."""
+    json_str = extract_json(raw)
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invalid json from llm: {e}\nraw snippet: {json_str[:200]}")
+    return validate_llm_output(data)
+
 # ── api clients ─────────────────────────────────────────────
 
 def get_surplus_client() -> AsyncOpenAI:
@@ -115,13 +142,11 @@ async def fetch_from_surplus(match_query: str) -> dict:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": USER_PROMPT_TEMPLATE.format(match=match_query)}
         ],
-        response_format={"type": "json_object"},
         temperature=0.1,
         max_tokens=600
     )
     raw = response.choices[0].message.content
-    data = json.loads(raw)
-    return validate_llm_output(data)
+    return parse_llm_response(raw)
 
 async def fetch_from_openai(match_query: str) -> dict:
     client = get_openai_client()
@@ -136,8 +161,7 @@ async def fetch_from_openai(match_query: str) -> dict:
         max_tokens=600
     )
     raw = response.choices[0].message.content
-    data = json.loads(raw)
-    return validate_llm_output(data)
+    return parse_llm_response(raw)
 
 async def fetch_true_probabilities(match_query: str) -> dict:
     if os.getenv("SURPLUS_API_KEY"):
