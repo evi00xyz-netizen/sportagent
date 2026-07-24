@@ -190,6 +190,8 @@ def resolve_exact_slug(market_title: str) -> str:
     if not clean_title:
         return "unknown-market"
 
+    fallback_slug = to_slug(clean_title)
+
     try:
         q = urllib.parse.quote(clean_title)
         url = f"https://gamma-api.polymarket.com/events?q={q}"
@@ -198,30 +200,41 @@ def resolve_exact_slug(market_title: str) -> str:
             if response.status == 200:
                 data = json.loads(response.read().decode('utf-8'))
                 if isinstance(data, list) and len(data) > 0:
+                    clean_lower = clean_title.lower()
+                    words = [w for w in re.split(r'\W+', clean_lower) if len(w) > 2]
+
+                    best_slug = None
+                    best_match_count = 0
+
                     for ev in data:
-                        if isinstance(ev, dict):
-                            markets = ev.get("markets")
-                            if isinstance(markets, list):
-                                for m in markets:
-                                    if isinstance(m, dict):
-                                        if m.get("marketSlug"):
-                                            _slug_cache[market_title] = m["marketSlug"]
-                                            return m["marketSlug"]
-                                        if m.get("slug"):
-                                            _slug_cache[market_title] = m["slug"]
-                                            return m["slug"]
-                            if ev.get("slug"):
-                                _slug_cache[market_title] = ev["slug"]
-                                return ev["slug"]
-                            if ev.get("eventSlug"):
-                                _slug_cache[market_title] = ev["eventSlug"]
-                                return ev["eventSlug"]
+                        if not isinstance(ev, dict):
+                            continue
+                        ev_title = (ev.get("title") or "").lower()
+                        ev_slug = ev.get("slug") or ev.get("eventSlug")
+
+                        markets = ev.get("markets") or []
+                        for m in markets:
+                            if not isinstance(m, dict):
+                                continue
+                            m_question = (m.get("question") or m.get("title") or "").lower()
+                            m_slug = m.get("marketSlug") or m.get("slug") or ev_slug
+
+                            if not m_slug:
+                                continue
+
+                            match_count = sum(1 for w in words if w in m_question or w in ev_title or w in m_slug)
+                            if match_count > best_match_count:
+                                best_match_count = match_count
+                                best_slug = m_slug
+
+                    if best_slug and best_match_count >= max(1, len(words) // 3):
+                        _slug_cache[market_title] = best_slug
+                        return best_slug
     except Exception as e:
         print(f"[Slug Resolve Warning] Gamma API lookup error for '{market_title}': {e}", file=sys.stderr)
 
-    res = to_slug(clean_title)
-    _slug_cache[market_title] = res
-    return res
+    _slug_cache[market_title] = fallback_slug
+    return fallback_slug
 
 def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
     """Parses CLI output (JSON or table) into header text and individual position objects."""
@@ -236,15 +249,12 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
             total_pnl = 0.0
             for item in data:
                 title = item.get("title") or item.get("market") or item.get("question") or "Unknown Market"
-                raw_slug = item.get("marketSlug") or item.get("eventSlug") or item.get("slug")
+                raw_slug = item.get("marketSlug") or item.get("slug") or item.get("eventSlug")
 
-                resolved = resolve_exact_slug(title)
-                if resolved and resolved != "unknown-market":
-                    m_slug = resolved
-                elif raw_slug and not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug:
-                    m_slug = raw_slug
+                if raw_slug and isinstance(raw_slug, str) and not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug and len(raw_slug.strip()) > 0:
+                    m_slug = raw_slug.strip()
                 else:
-                    m_slug = to_slug(title)
+                    m_slug = resolve_exact_slug(title)
 
                 outcome = item.get("outcome") or item.get("outcomeName") or "Yes"
                 status = item.get("status", "open")
