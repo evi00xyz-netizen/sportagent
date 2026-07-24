@@ -31,11 +31,9 @@ def set_min_edge(guild_id: int, edge: float):
     user_settings[guild_id]["min_edge"] = edge
 
 # ── sport detection ─────────────────────────────────────────
-# sports where draws are impossible (always a winner after OT/extra innings)
 NO_DRAW_SPORTS = {"mlb", "nba", "nfl", "nhl", "baseball", "basketball", "football", "hockey",
                   "american football", "ice hockey"}
 
-# team name → sport mapping for common teams across major leagues
 TEAM_SPORT_MAP = {
     # MLB
     "diamondbacks": "mlb", "braves": "mlb", "orioles": "mlb", "red sox": "mlb",
@@ -77,11 +75,7 @@ TEAM_SPORT_MAP = {
 }
 
 def detect_sport(match_query: str) -> str:
-    """Detect the sport from the match query string.
-    Returns 'mlb', 'nba', 'nfl', 'nhl', or 'soccer' (default)."""
     query_lower = match_query.lower()
-
-    # check for explicit sport keywords
     for sport in NO_DRAW_SPORTS:
         if sport in query_lower:
             if sport in ("baseball",):
@@ -92,18 +86,12 @@ def detect_sport(match_query: str) -> str:
                 return "nfl"
             if sport in ("hockey", "ice hockey"):
                 return "nhl"
-            return sport  # mlb, nba, nfl, nhl
-
-    # check team names
+            return sport
     for team, sport in TEAM_SPORT_MAP.items():
         if team in query_lower:
             return sport
-
-    # check for "vs" pattern with known team indicators
-    # if we see "vs" and both sides look like team names, default to soccer
     if " vs " in query_lower or " vs. " in query_lower:
         return "soccer"
-
     return "unknown"
 
 def sport_has_draws(sport: str) -> bool:
@@ -144,7 +132,6 @@ USER_PROMPT_TEMPLATE = (
 def build_user_prompt(match_query: str) -> str:
     sport = detect_sport(match_query)
     draws_possible = sport_has_draws(sport)
-
     if draws_possible:
         draw_rule = ""
     else:
@@ -152,7 +139,6 @@ def build_user_prompt(match_query: str) -> str:
             f"IMPORTANT: {sport.upper()} does NOT have draws. "
             "Set draw to 0.0. Only home_win and away_win should sum to 1.0.\n"
         )
-
     return USER_PROMPT_TEMPLATE.format(
         match=match_query,
         sport=sport.upper(),
@@ -169,12 +155,15 @@ PROB_KEYS = {"home_win", "draw", "away_win"}
 FACTOR_KEYS = {"home_form", "away_form", "home_absences", "away_absences", "tactical_edge"}
 
 def _strip_control_chars(s: str) -> str:
-    """remove all ascii control characters except space, \\n, \\t."""
     return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', s)
 
 def _strip_trailing_commas(json_str: str) -> str:
-    """remove trailing commas before closing } or ]."""
     return re.sub(r',\s*([]}])', r'\1', json_str)
+
+def _normalize_double_braces(text: str) -> str:
+    """collapse {{ }} → { } — some models double-escape braces."""
+    text = text.replace("{{", "{").replace("}}", "}")
+    return text
 
 def extract_json(raw: str) -> str:
     """aggressive json extraction."""
@@ -183,6 +172,7 @@ def extract_json(raw: str) -> str:
 
     raw = _strip_control_chars(raw)
     raw = raw.strip().lstrip("\ufeff\u200b\u200c\u200d\u2060")
+    raw = _normalize_double_braces(raw)
 
     # case 1: markdown code block
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL | re.IGNORECASE)
@@ -237,16 +227,12 @@ def validate_llm_output(data: dict, sport: str) -> dict:
     total = tp["home_win"] + tp["draw"] + tp["away_win"]
     if abs(total - 1.0) > 0.015:
         raise ValueError(f"probabilities sum to {total:.4f}, expected 1.0")
-
-    # for no-draw sports, force draw to 0.0 regardless of what the model returned
     if not sport_has_draws(sport):
         tp["draw"] = 0.0
-        # re-normalize home_win + away_win to 1.0
         hw_aw = tp["home_win"] + tp["away_win"]
         if hw_aw > 0:
             tp["home_win"] = tp["home_win"] / hw_aw
             tp["away_win"] = tp["away_win"] / hw_aw
-
     mf = data["matrix_factors"]
     missing_f = FACTOR_KEYS - set(mf.keys())
     if missing_f:
@@ -274,16 +260,14 @@ async def fetch_true_probabilities(match_query: str) -> dict:
             {"role": "user",   "content": user_prompt}
         ],
         temperature=0.1,
-        max_tokens=2000,
+        max_tokens=4000,
     )
     msg = response.choices[0].message
 
-    # reasoning models (glm-5.2) put output in reasoning_content, not content
     raw = msg.content or ""
     if not raw and hasattr(msg, "reasoning_content") and msg.reasoning_content:
         raw = msg.reasoning_content
 
-    # dump to stderr
     print(f"\nLLM RAW ({SURPLUS_MODEL}): {repr(raw)[:2000]}\n", file=sys.stderr)
 
     json_str = extract_json(raw)
