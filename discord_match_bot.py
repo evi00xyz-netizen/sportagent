@@ -16,6 +16,14 @@ SURPLUS_API_KEY  = os.getenv("SURPLUS_API_KEY")
 SURPLUS_BASE_URL = os.getenv("SURPLUS_API_URL", "https://api.surplusintelligence.ai/min30/v1")
 SURPLUS_MODEL    = os.getenv("SURPLUS_MODEL", "gpt-5.4")
 
+# discord embed field limit
+EMBED_FIELD_MAX = 1024
+
+def _trunc(s: str, max_len: int = EMBED_FIELD_MAX) -> str:
+    if len(s) <= max_len:
+        return s
+    return s[:max_len-3] + "..."
+
 # ── discord setup ───────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
@@ -351,10 +359,10 @@ async def cmd_match(ctx, *, args: str):
 
         embed.add_field(
             name="True Probabilities (no odds bias)",
-            value=probs_text,
+            value=_trunc(probs_text),
             inline=False
         )
-        embed.add_field(name="Forecast", value=fc, inline=False)
+        embed.add_field(name="Forecast", value=_trunc(fc), inline=False)
 
         factor_lines = [
             f"Home form: {mf.get('home_form','?')}",
@@ -363,7 +371,7 @@ async def cmd_match(ctx, *, args: str):
             f"Away absences: {mf.get('away_absences','none')}",
             f"Tactical edge: {mf.get('tactical_edge','none')}"
         ]
-        embed.add_field(name="Factors", value="\n".join(factor_lines), inline=False)
+        embed.add_field(name="Factors", value=_trunc("\n".join(factor_lines)), inline=False)
 
         if oh and oa:
             calc = calculate_edges(tp, oh, od, oa)
@@ -377,7 +385,7 @@ async def cmd_match(ctx, *, args: str):
                 edge_lines.append(f"Draw implied: {implied['draw']*100:.1f}%  |  edge: {edges['draw']*100:+.1f}%")
             edge_lines.append(f"Away implied: {implied['away']*100:.1f}%  |  edge: {edges['away']*100:+.1f}%")
 
-            embed.add_field(name="Market Edge", value="\n".join(edge_lines), inline=False)
+            embed.add_field(name="Market Edge", value=_trunc("\n".join(edge_lines)), inline=False)
 
             bets = []
             if edges["home"] >= min_edge:
@@ -390,7 +398,7 @@ async def cmd_match(ctx, *, args: str):
             if bets:
                 embed.add_field(
                     name=f"VALUE (min edge ≥ {min_edge*100:.1f}%)",
-                    value="\n".join(f"✅ {b}" for b in bets),
+                    value=_trunc("\n".join(f"✅ {b}" for b in bets)),
                     inline=False
                 )
             else:
@@ -403,31 +411,27 @@ async def cmd_match(ctx, *, args: str):
         embed.set_footer(text=f"Engine: {src}  |  min edge: {min_edge*100:.1f}%  |  confidence: {data.get('confidence','?')}")
         await ctx.send(embed=embed)
 
-# ── global error handler — catches all unhandled command errors ──
+# ── global error handler ────────────────────────────────────
 
 @bot.event
 async def on_command_error(ctx, error):
-    """Global error handler — prevents the bot from crashing on any command error."""
     if isinstance(error, commands.CommandNotFound):
-        return  # silently ignore unknown commands
+        return
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"Missing argument. Usage: `!{ctx.command.name} <args>`")
         return
     if isinstance(error, commands.BadArgument):
         await ctx.send(f"Bad argument. Check the format and try again.")
         return
-
-    # everything else — log and send a clean message, never crash
     print(f"[ERROR] {ctx.command}: {error}", file=sys.stderr)
     traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
-
     try:
         await ctx.send(
             f"Something went wrong. The bot is still running — try again.\n"
             f"`{type(error).__name__}`"
         )
     except Exception:
-        pass  # can't even send the error message — nothing we can do
+        pass
 
 # ── lifecycle ───────────────────────────────────────────────
 
@@ -451,12 +455,10 @@ async def main():
     if not token:
         print("FATAL: DISCORD_BOT_TOKEN not set", file=sys.stderr)
         sys.exit(1)
-
     async with bot:
         await bot.start(token)
 
 if __name__ == "__main__":
-    # handle SIGTERM/SIGINT gracefully (systemd stop, Ctrl+C)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -469,7 +471,7 @@ if __name__ == "__main__":
         try:
             loop.add_signal_handler(sig, shutdown)
         except NotImplementedError:
-            pass  # windows doesn't support add_signal_handler
+            pass
 
     try:
         loop.run_until_complete(main())
