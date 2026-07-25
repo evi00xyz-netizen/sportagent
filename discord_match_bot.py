@@ -252,8 +252,69 @@ def run_bullpen_positions(address: str = None, source: str = None, json_mode: bo
     except Exception as e:
         return f"[Error] Failed to execute bullpen CLI: {e}"
 
-# strict ticker regex — matches structured sport tickers like mlb-kc-det-2026-07-24, nba-lal-bos-2026-06-15, etc.
-_TICKER_RE = re.compile(r'\b([a-z]{3,5}-[a-z]{2,5}-[a-z]{2,5}-\d{4}-\d{2}-\d{2})\b')
+# ── TICKER EXTRACTION ───────────────────────────────────────
+# Handles ALL Polymarket ticker formats:
+#   MLB: mlb-kc-det-2026-07-24   (3-letter teams)
+#   NBA: nba-lal-bos-2026-06-15   (3-letter teams)
+#   Tennis: atp-dedurap-onclin-2026-07-25  (variable-length player names)
+#   Soccer: kor-poh-jeo-2026-07-25  (3-letter teams)
+#
+# Format: SPORT-NAME1-NAME2-YYYY-MM-DD where each name is 2-15 alphanumeric chars.
+_TICKER_RE = re.compile(
+    r'\b([a-z]{2,15}-[a-z]{2,15}-[a-z]{2,15}-\d{4}-\d{2}-\d{2})\b',
+    re.IGNORECASE
+)
+
+# Broader catch-all for ANY ticker-looking pattern in "Did you mean:" parentheticals.
+# Matches: (atp-dedurap-onclin-2026-07-25), (mlb-who-will-win-...), etc.
+_PAREN_TICKER_RE = re.compile(
+    r'\(([a-z][a-z0-9\-]{5,}[a-z0-9])\)',
+    re.IGNORECASE
+)
+
+def _extract_all_tickers(text: str, exclude_slug: str = None) -> list[str]:
+    """Extract ALL possible Polymarket tickers/slugs from combined CLI output.
+    Uses multiple regex patterns to catch every format.
+    Returns deduplicated list, excluding the original slug that failed."""
+    candidates = []
+
+    # Pattern 1: Structured sport tickers with date (atp-dedurap-onclin-2026-07-25)
+    for m in _TICKER_RE.finditer(text):
+        ticker = m.group(1).lower()
+        if ticker not in candidates:
+            candidates.append(ticker)
+
+    # Pattern 2: Any parenthetical that looks like a slug
+    for m in _PAREN_TICKER_RE.finditer(text):
+        slug = m.group(1).lower()
+        # Filter: must contain at least one hyphen AND look like a polymarket slug
+        if '-' in slug and slug not in candidates:
+            candidates.append(slug)
+
+    # Pattern 3: "Did you mean:" lines — capture the last parenthetical on each numbered line
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.match(r'^\d+\.', stripped):
+            # Find the LAST parenthetical on this line
+            parens = re.findall(r'\(([^)]+)\)', stripped)
+            if parens:
+                last = parens[-1].strip().lower()
+                if '-' in last and len(last) > 5 and last not in candidates:
+                    candidates.append(last)
+
+    # Filter out the original failing slug
+    if exclude_slug:
+        candidates = [c for c in candidates if c != exclude_slug.lower()]
+
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            result.append(c)
+
+    return result
 
 def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
     """Executes `bullpen polymarket sell <slug> <outcome> <shares>` with exact market ticker.
@@ -273,36 +334,31 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
     except subprocess.TimeoutExpired:
         return "[Error] `bullpen polymarket sell` command timed out."
     except subprocess.CalledProcessError as e:
-        # CRITICAL FIX: combine stdout AND stderr — "Did you mean:" suggestions
-        # are in stdout, but stderr might also contain text. Use both.
+        # CRITICAL: combine ALL output streams — bullpen splits "Did you mean:"
+        # across stdout and stderr unpredictably.
         combined = (e.stdout or "") + "\n" + (e.stderr or "")
+        # Also try e.output as fallback (some Python versions use this)
+        if not combined.strip():
+            combined = getattr(e, 'output', '') or ''
 
-        # Extract structured sport tickers (mlb-xxx-xxx-YYYY-MM-DD, nba-xxx-xxx-YYYY-MM-DD, etc.)
-        suggested_tickers = _TICKER_RE.findall(combined)
+        print(f"[Sell Debug] combined output ({len(combined)} chars): {combined[:500]}", file=sys.stderr)
 
-        # Also extract any slug from "Did you mean:" lines, e.g.:
-        #   "1. Kansas City Royals vs. Detroit Tigers (mlb-kc-det-2026-07-23)"
-        #   "2. MLB: Who will win... (mlb-who-will-win-chicago-cubs-vs-pittsburgh-pirates-...)"
-        slug_from_did_you_mean = re.findall(r'\(([a-z0-9][a-z0-9\-]{3,}[a-z0-9])\)', combined)
-        all_candidates = suggested_tickers + slug_from_did_you_mean
+        # Extract ALL possible tickers from the combined output
+        all_candidates = _extract_all_tickers(combined, exclude_slug=market_slug)
+
+        print(f"[Sell Debug] Extracted candidates: {all_candidates}", file=sys.stderr)
 
         if all_candidates:
-            seen = set()
-            unique_candidates = []
-            for t in all_candidates:
-                if t != market_slug and t not in seen:
-                    seen.add(t)
-                    unique_candidates.append(t)
-
-            for ticker in unique_candidates:
+            for ticker in all_candidates[:5]:  # try up to 5 candidates
                 print(f"[Sell Instant Retry] Retrying with suggested ticker: {ticker}", file=sys.stderr)
                 retry_parts = [bin_path, "polymarket", "sell", ticker, outcome, str(shares)]
                 try:
                     res_retry = subprocess.run(retry_parts, capture_output=True, text=True, check=True, timeout=15, env=env)
+                    print(f"[Sell Instant Retry] SUCCESS with ticker: {ticker}", file=sys.stderr)
                     return res_retry.stdout.strip()
                 except Exception as retry_err:
                     combined_retry = (getattr(retry_err, 'stdout', '') or '') + "\n" + (getattr(retry_err, 'stderr', '') or '')
-                    print(f"[Sell Retry Failed for {ticker}] {combined_retry[:300]}", file=sys.stderr)
+                    print(f"[Sell Retry Failed for {ticker}] {combined_retry[:200]}", file=sys.stderr)
 
         err_out = combined.strip() or f"Exit code {e.returncode}"
         return f"[Sell Error] Exit code {e.returncode}: {_trunc(err_out, 900)}"
@@ -415,7 +471,7 @@ def fetch_exact_slug_by_id(token_or_condition_id: str) -> str:
         "Accept": "application/json"
     }
 
-    # Try multiple Gamma API endpoints in parallel (fastest wins)
+    # Try multiple Gamma API endpoints
     endpoints = [
         f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_or_condition_id}",
         f"https://gamma-api.polymarket.com/markets?condition_id={token_or_condition_id}",
