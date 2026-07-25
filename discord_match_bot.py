@@ -211,7 +211,6 @@ def fetch_exact_slug_by_id(token_or_condition_id: str) -> str:
                 data = json.loads(resp.read().decode('utf-8'))
                 if isinstance(data, list) and len(data) > 0:
                     m = data[0]
-                    # Get marketSlug or event ticker from market metadata
                     exact_slug = m.get("marketSlug") or m.get("slug")
                     if exact_slug:
                         clean_slug = re.sub(r'-+', '-', exact_slug.strip())
@@ -237,14 +236,12 @@ def fetch_exact_slug_by_id(token_or_condition_id: str) -> str:
     except Exception as e:
         print(f"[Condition ID Lookup Error] {e}", file=sys.stderr)
 
-    # Cache negative result so we don't repeat failed network requests
     _slug_cache[token_or_condition_id] = None
     return None
 
 def resolve_exact_slug(market_title: str, item_dict: dict = None) -> str:
     """Resolves the exact 100% valid Polymarket ticker/slug for sell execution."""
     if item_dict and isinstance(item_dict, dict):
-        # 1. Check all ID fields returned by Bullpen JSON
         for id_key in ["asset_id", "assetId", "tokenId", "token_id", "conditionId", "condition_id", "market_id", "marketId"]:
             val = item_dict.get(id_key)
             if val:
@@ -252,7 +249,6 @@ def resolve_exact_slug(market_title: str, item_dict: dict = None) -> str:
                 if exact:
                     return exact
 
-        # 2. Check direct event ticker / marketSlug fields
         for slug_key in ["eventTicker", "ticker", "marketSlug", "slug", "eventSlug"]:
             raw_slug = item_dict.get(slug_key)
             if raw_slug and isinstance(raw_slug, str) and len(raw_slug.strip()) > 0:
@@ -267,7 +263,6 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
     if not raw_output or raw_output.startswith("[Error]") or raw_output.startswith("[Bullpen Error]"):
         return f"```\n{raw_output}\n```", []
 
-    # Attempt parsing structured JSON output
     try:
         data = json.loads(raw_output)
         if isinstance(data, list):
@@ -324,7 +319,6 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # Table text parsing fallback
     lines = raw_output.splitlines()
     summary_line = ""
     source_line = ""
@@ -551,7 +545,6 @@ async def bullpen_watcher_loop():
                                 await channel.send(embed=embed)
 
                                 if auto_close:
-                                    # Execute all stop-loss sells concurrently in parallel
                                     close_tasks = [close_position_task(channel, tp) for tp in triggered_positions]
                                     await asyncio.gather(*close_tasks)
 
@@ -841,6 +834,69 @@ def calculate_edges(true_probs: dict, odds_home: float = None, odds_draw: float 
         "overround_pct": (total - 1.0) * 100
     }
 
+# ── discord button view for !match ──────────────────────────
+
+class MatchActionView(discord.ui.View):
+    def __init__(self, match_query: str):
+        super().__init__(timeout=180)
+        self.match_query = match_query
+
+    @discord.ui.button(label="🔄 Refresh Analysis", style=discord.ButtonStyle.primary, custom_id="btn_refresh_match")
+    async def refresh_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(thinking=True)
+        try:
+            data = await fetch_true_probabilities(self.match_query)
+            sport = detect_sport(self.match_query)
+            has_draws = sport_has_draws(sport)
+            tp = data["true_probabilities"]
+            mf = data["matrix_factors"]
+            fc = data.get("forecast", "N/A")
+
+            embed = discord.Embed(
+                title=f"Matrix: {data.get('match_name', self.match_query)} ({sport.upper()})",
+                color=discord.Color.blue()
+            )
+            probs_text = f"**{data.get('home_team','Home')}**: {tp['home_win']*100:.1f}%\n"
+            if has_draws:
+                probs_text += f"**Draw**: {tp.get('draw',0)*100:.1f}%\n"
+            probs_text += f"**{data.get('away_team','Away')}**: {tp['away_win']*100:.1f}%"
+
+            embed.add_field(name="True Probabilities (Refreshed)", value=_trunc(probs_text), inline=False)
+            embed.add_field(name="Forecast", value=_trunc(fc), inline=False)
+
+            factor_lines = [
+                f"Home form: {mf.get('home_form','?')}",
+                f"Away form: {mf.get('away_form','?')}",
+                f"Home absences: {mf.get('home_absences','none')}",
+                f"Away absences: {mf.get('away_absences','none')}",
+                f"Tactical edge: {mf.get('tactical_edge','none')}"
+            ]
+            embed.add_field(name="Factors", value=_trunc("\n".join(factor_lines)), inline=False)
+            embed.set_footer(text=f"Engine: Surplus ({SURPLUS_MODEL}) | confidence: {data.get('confidence','?')}")
+
+            await interaction.followup.send(embed=embed, view=MatchActionView(self.match_query))
+        except Exception as e:
+            await interaction.followup.send(f"❌ Refresh failed: {e}", ephemeral=True)
+
+    @discord.ui.button(label="📊 Open Positions", style=discord.ButtonStyle.secondary, custom_id="btn_open_positions")
+    async def positions_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(thinking=True)
+        try:
+            output = await fetch_positions_output()
+            header, pos_objs = parse_positions_to_cards(output)
+            if pos_objs:
+                cards = [format_card_from_obj(p) for p in pos_objs[:5]]
+                embed = discord.Embed(
+                    title="📊 Active Open Positions",
+                    description="\n\n".join(cards),
+                    color=discord.Color.gold()
+                )
+            else:
+                embed = discord.Embed(title="📊 Open Positions", description=header or "No open positions found.", color=discord.Color.gold())
+            await interaction.followup.send(embed=embed)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to fetch positions: {e}", ephemeral=True)
+
 # ── discord commands ────────────────────────────────────────
 
 @bot.command(name="open", aliases=["positions", "p"])
@@ -1071,7 +1127,8 @@ async def cmd_match(ctx, *, args: str):
                 )
 
         embed.set_footer(text=f"Engine: {src}  |  min edge: {min_edge*100:.1f}%  |  confidence: {data.get('confidence','?')}")
-        await ctx.send(embed=embed)
+        view = MatchActionView(match_query)
+        await ctx.send(embed=embed, view=view)
 
 # ── event listeners ─────────────────────────────────────────
 
