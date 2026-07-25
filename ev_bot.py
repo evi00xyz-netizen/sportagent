@@ -1,12 +1,12 @@
 """
-ev_bot.py — EV-Based Polymarket Betting Bot (Flat Bet / Analysis Mode)
+ev_bot.py — EV-Based Polymarket Betting Bot (Kelly Criterion Mode)
 ======================================================================
 Architecture:
   1. Gamma API      → fetch market data + clobTokenIds
-  2. OpenAI (gpt-5.4) → Pydantic Structured Outputs for fundamental probabilities
+  2. OpenAI (gpt-5.4) → fundamental probabilities (no market data)
   3. CLOB API       → live best-ask prices → decimal odds
   4. EV Math        → deterministic EV = (prob * odds) - 1
-  5. Flat Bet       → displays exact bet sizing, no on-chain execution needed
+  5. Kelly Staking  → f* = EV / (odds - 1), scaled by kelly fraction
 
 No private keys, no funder address, no py-clob-client required.
 Run independently alongside your existing discord_match_bot.py.
@@ -35,7 +35,8 @@ SURPLUS_API_KEY    = os.getenv("SURPLUS_API_KEY")
 SURPLUS_BASE_URL   = os.getenv("SURPLUS_API_URL", "https://api.surplusintelligence.ai/min30/v1")
 SURPLUS_MODEL      = os.getenv("SURPLUS_MODEL", "gpt-5.4")
 DEFAULT_EV_THRESHOLD = float(os.getenv("EV_THRESHOLD", "0.05"))
-DEFAULT_BET_SIZE_USD = float(os.getenv("DEFAULT_BET_SIZE", "10.0"))
+DEFAULT_KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.5"))
+DEFAULT_BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
 
 # ── Pydantic Structured Output Schema ───────────────────────
 
@@ -49,7 +50,6 @@ class MatchProbabilities(BaseModel):
     key_factors: str = Field(...)
     confidence: float = Field(..., ge=0.0, le=1.0)
 
-# JSON Schema as a string for the system prompt (not response_format)
 JSON_SCHEMA_STRING = """{
   "home_win": <float 0-1>,
   "draw": <float 0-1>,
@@ -194,19 +194,14 @@ def get_openai_client() -> AsyncOpenAI:
 
 
 def _extract_json_from_text(text: str) -> dict:
-    """Robust JSON extraction from LLM output — handles markdown, prose, etc."""
-    # Strip markdown code blocks
     cleaned = text.strip()
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', cleaned, re.DOTALL | re.IGNORECASE)
     if m:
         cleaned = m.group(1).strip()
-
-    # Find the outermost JSON object
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start >= 0 and end > start:
         cleaned = cleaned[start:end+1]
-
     return json.loads(cleaned)
 
 
@@ -220,7 +215,6 @@ async def fetch_fundamental_probabilities(
         league=league, match_date=match_date,
     )
 
-    # Try json_object mode first (broader API compatibility than json_schema)
     try:
         response = await client.chat.completions.create(
             model=SURPLUS_MODEL,
@@ -235,13 +229,10 @@ async def fetch_fundamental_probabilities(
         raw = response.choices[0].message.content
         if not raw:
             raise ValueError("empty response from LLM")
-
         print(f"[OpenAI] Raw response ({len(raw)} chars): {raw[:200]}...", file=sys.stderr)
         data = _extract_json_from_text(raw)
-
     except Exception as e:
         print(f"[OpenAI] json_object mode failed ({e}), trying raw completion", file=sys.stderr)
-        # Fallback: no response_format at all
         response = await client.chat.completions.create(
             model=SURPLUS_MODEL,
             messages=[
@@ -255,7 +246,6 @@ async def fetch_fundamental_probabilities(
         print(f"[OpenAI] Raw fallback response ({len(raw)} chars): {raw[:200]}...", file=sys.stderr)
         data = _extract_json_from_text(raw)
 
-    # Validate and normalize
     home = float(data.get("home_win", 0.33))
     draw = float(data.get("draw", 0.34))
     away = float(data.get("away_win", 0.33))
@@ -299,16 +289,52 @@ def calculate_ev(probs: MatchProbabilities, clob_prices: dict) -> dict:
     return results
 
 
-def calculate_flat_bet(ev: float, prob: float, bet_size: float, threshold: float) -> Optional[dict]:
-    if ev < threshold:
+# ── Kelly Criterion Staking ─────────────────────────────────
+
+def calculate_kelly_bet(
+    ev: float,
+    prob: float,
+    odds: float,
+    bankroll: float,
+    kelly_fraction: float,
+    threshold: float,
+) -> Optional[dict]:
+    """
+    Kelly Criterion: f* = (p * b - q) / b
+    where b = odds - 1 (net odds), p = prob, q = 1 - p
+
+    Simplified: f* = EV / (odds - 1)  [equivalent when EV > 0]
+
+    Then scale by kelly_fraction (e.g. 0.5 = half-Kelly).
+    """
+    if ev < threshold or odds <= 1.0:
         return None
-    expected_profit = bet_size * ev
-    kelly_fraction = ev / 2 if ev > 0 else None
+
+    # Full Kelly fraction of bankroll
+    b = odds - 1.0  # net odds
+    if b <= 0:
+        return None
+
+    full_kelly_pct = ev / b  # f* = EV / (odds - 1)
+    if full_kelly_pct <= 0:
+        return None
+
+    # Apply Kelly fraction multiplier
+    scaled_kelly_pct = full_kelly_pct * kelly_fraction
+
+    # Cap at 25% of bankroll per single bet (risk management)
+    scaled_kelly_pct = min(scaled_kelly_pct, 0.25)
+
+    stake = bankroll * scaled_kelly_pct
+    expected_profit = stake * ev
+
     return {
-        "bet_amount": bet_size,
+        "full_kelly_pct": full_kelly_pct * 100,
+        "kelly_fraction": kelly_fraction,
+        "scaled_kelly_pct": scaled_kelly_pct * 100,
+        "stake": stake,
         "expected_profit": expected_profit,
         "expected_roi_pct": ev * 100,
-        "kelly_reference": kelly_fraction,
     }
 
 
@@ -319,7 +345,8 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 ev_thresholds = {}
-bet_sizes = {}
+kelly_fractions = {}
+bankrolls = {}
 
 def get_ev_threshold(guild_id: int) -> float:
     return ev_thresholds.get(guild_id, DEFAULT_EV_THRESHOLD)
@@ -327,25 +354,31 @@ def get_ev_threshold(guild_id: int) -> float:
 def set_ev_threshold(guild_id: int, threshold: float):
     ev_thresholds[guild_id] = threshold
 
-def get_bet_size(guild_id: int) -> float:
-    return bet_sizes.get(guild_id, DEFAULT_BET_SIZE_USD)
+def get_kelly_fraction(guild_id: int) -> float:
+    return kelly_fractions.get(guild_id, DEFAULT_KELLY_FRACTION)
 
-def set_bet_size(guild_id: int, size: float):
-    bet_sizes[guild_id] = size
+def set_kelly_fraction(guild_id: int, fraction: float):
+    kelly_fractions[guild_id] = fraction
+
+def get_bankroll(guild_id: int) -> float:
+    return bankrolls.get(guild_id, DEFAULT_BANKROLL)
+
+def set_bankroll(guild_id: int, bankroll: float):
+    bankrolls[guild_id] = bankroll
 
 
 @bot.command(name="ev")
 async def cmd_ev(ctx, *, args: str = ""):
-    """Analyze a Polymarket football event and calculate EV with flat bet sizing."""
+    """Analyze a Polymarket football event and calculate EV with Kelly staking."""
     print(f"[EV CMD] Received !ev from {ctx.author} with args: '{args}'", file=sys.stderr)
 
     if not args:
         help_text = (
-            "**EV Bot — Flat Bet Analysis**\n"
-            "`!ev <polymarket_url>` — Analyze match, show EV + flat bet sizing\n"
-            "`!ev <polymarket_url> --bet <amount>` — Custom bet size\n"
+            "**EV Bot — Kelly Criterion Mode**\n"
+            "`!ev <polymarket_url>` — Analyze match, show EV + Kelly stakes\n"
             "`!ev threshold <0.05>` — Set EV threshold (e.g. 0.05 = 5%)\n"
-            "`!ev betsize <25>` — Set default flat bet size in USD\n"
+            "`!ev kelly <0.5>` — Set Kelly fraction (0.5 = half-Kelly, 0.25 = quarter-Kelly)\n"
+            "`!ev bankroll <1000>` — Set bankroll size in USD\n"
             "`!evstatus` — Show current config"
         )
         await ctx.send(help_text)
@@ -366,31 +399,45 @@ async def cmd_ev(ctx, *, args: str = ""):
                 await ctx.send("❌ Invalid threshold. Use: `!ev threshold 0.05`")
                 return
 
-        # ── Handle bet size setting ──
-        if args.lower().startswith("betsize"):
+        # ── Handle Kelly fraction setting ──
+        if args.lower().startswith("kelly"):
             try:
                 parts = args.split()
                 if len(parts) >= 2:
-                    new_size = float(parts[1])
+                    new_kelly = float(parts[1])
+                    if new_kelly <= 0 or new_kelly > 1.0:
+                        await ctx.send("❌ Kelly fraction must be between 0.01 and 1.0")
+                        return
                     gid = ctx.guild.id if ctx.guild else ctx.author.id
-                    set_bet_size(gid, new_size)
-                    await ctx.send(f"✅ Default flat bet size set to **${new_size:.2f}**")
+                    set_kelly_fraction(gid, new_kelly)
+                    label = "full-Kelly" if new_kelly == 1.0 else f"{new_kelly*100:.0f}%-Kelly"
+                    await ctx.send(f"✅ Kelly fraction set to **{new_kelly}** ({label})")
                     return
             except ValueError:
-                await ctx.send("❌ Invalid bet size. Use: `!ev betsize 25`")
+                await ctx.send("❌ Invalid Kelly fraction. Use: `!ev kelly 0.5`")
                 return
 
-        # ── Parse args ──
-        custom_bet_size = None
-        bet_match = re.search(r'--bet\s+(\d+(?:\.\d+)?)', args)
-        if bet_match:
-            custom_bet_size = float(bet_match.group(1))
-            args = args.replace(bet_match.group(0), "").strip()
+        # ── Handle bankroll setting ──
+        if args.lower().startswith("bankroll"):
+            try:
+                parts = args.split()
+                if len(parts) >= 2:
+                    new_br = float(parts[1])
+                    if new_br <= 0:
+                        await ctx.send("❌ Bankroll must be positive")
+                        return
+                    gid = ctx.guild.id if ctx.guild else ctx.author.id
+                    set_bankroll(gid, new_br)
+                    await ctx.send(f"✅ Bankroll set to **${new_br:,.2f}**")
+                    return
+            except ValueError:
+                await ctx.send("❌ Invalid bankroll. Use: `!ev bankroll 1000`")
+                return
 
+        # ── Parse URL ──
         url = args.strip()
         print(f"[EV CMD] URL to analyze: '{url}'", file=sys.stderr)
 
-        # ── Extract slug ──
         slug = parse_polymarket_url(url)
         if not slug:
             await ctx.send(f"❌ Could not extract event slug from URL. Use a full Polymarket event URL like:\n`https://polymarket.com/event/<slug>`")
@@ -465,15 +512,22 @@ async def cmd_ev(ctx, *, args: str = ""):
             ev_results = calculate_ev(probs, clob_prices)
             gid = ctx.guild.id if ctx.guild else ctx.author.id
             threshold = get_ev_threshold(gid)
-            bet_size = custom_bet_size or get_bet_size(gid)
+            kelly_frac = get_kelly_fraction(gid)
+            bankroll = get_bankroll(gid)
 
             # ── Build Discord Embed ──
+            kelly_label = "Full-Kelly" if kelly_frac == 1.0 else f"{kelly_frac*100:.0f}%-Kelly"
             embed = discord.Embed(
                 title=f"📊 EV Analysis: {probs.match_name}",
-                description=f"**League:** {league} | **Date:** {match_date}\n**Slug:** `{slug}`",
+                description=(
+                    f"**League:** {league} | **Date:** {match_date}\n"
+                    f"**Slug:** `{slug}`\n"
+                    f"**Staking:** {kelly_label} | **Bankroll:** ${bankroll:,.2f} | **Threshold:** {threshold*100:.1f}%"
+                ),
                 color=discord.Color.blue(),
             )
 
+            # Probabilities
             prob_lines = [
                 f"🏠 **{probs.home_team}**: {probs.home_win*100:.1f}%",
                 f"🤝 **Draw**: {probs.draw*100:.1f}%",
@@ -481,8 +535,9 @@ async def cmd_ev(ctx, *, args: str = ""):
             ]
             embed.add_field(name="AI Fundamental Probabilities", value="\n".join(prob_lines), inline=False)
 
+            # CLOB Prices + EV + Kelly Stakes
             ev_lines = []
-            bet_lines = []
+            kelly_lines = []
             positive_ev_outcomes = []
 
             for outcome, label, emoji in [
@@ -495,15 +550,18 @@ async def cmd_ev(ctx, *, args: str = ""):
                 odds_str = f"{r['odds']:.2f}" if r["odds"] is not None else "N/A"
                 ev_str = f"{r['ev']*100:+.1f}%" if r["ev"] is not None else "N/A"
 
-                if r["ev"] is not None and r["ev"] >= threshold:
+                if r["ev"] is not None and r["ev"] >= threshold and r["odds"] is not None:
                     ev_lines.append(f"✅ {emoji} **{label}**: Price {price_str} | Odds {odds_str} | EV **{ev_str}**")
                     positive_ev_outcomes.append(outcome)
-                    flat = calculate_flat_bet(r["ev"], r["prob"], bet_size, threshold)
-                    if flat:
-                        bet_lines.append(
-                            f"{emoji} **{label}**: Bet `${flat['bet_amount']:.2f}` → "
-                            f"Expected profit `${flat['expected_profit']:.2f}` "
-                            f"({flat['expected_roi_pct']:+.1f}% ROI)"
+
+                    kelly = calculate_kelly_bet(r["ev"], r["prob"], r["odds"], bankroll, kelly_frac, threshold)
+                    if kelly:
+                        kelly_lines.append(
+                            f"{emoji} **{label}**: Stake **${kelly['stake']:,.2f}** "
+                            f"({kelly['scaled_kelly_pct']:.1f}% of bankroll)\n"
+                            f"　↳ Full Kelly: {kelly['full_kelly_pct']:.1f}% | "
+                            f"Expected profit: **${kelly['expected_profit']:,.2f}** "
+                            f"({kelly['expected_roi_pct']:+.1f}% ROI)"
                         )
                 elif r["ev"] is not None:
                     ev_lines.append(f"❌ {emoji} **{label}**: Price {price_str} | Odds {odds_str} | EV {ev_str}")
@@ -511,36 +569,56 @@ async def cmd_ev(ctx, *, args: str = ""):
                     ev_lines.append(f"⚪ {emoji} **{label}**: Price {price_str} | No EV data")
 
             embed.add_field(
-                name=f"CLOB Prices & EV (threshold: {threshold*100:.1f}%)",
-                value="\n".join(ev_lines), inline=False,
+                name=f"CLOB Prices & EV",
+                value="\n".join(ev_lines) if ev_lines else "No EV data available",
+                inline=False,
             )
 
-            if bet_lines:
+            if kelly_lines:
                 embed.add_field(
-                    name=f"💰 Flat Bet Sizing (${bet_size:.2f} per +EV outcome)",
-                    value="\n".join(bet_lines), inline=False,
+                    name=f"💰 Kelly Stakes ({kelly_label}, Bankroll: ${bankroll:,.2f})",
+                    value="\n".join(kelly_lines),
+                    inline=False,
                 )
 
+            # Key factors
             embed.add_field(name="Key Factors", value=probs.key_factors, inline=False)
             embed.add_field(name="AI Confidence", value=f"{probs.confidence*100:.0f}%", inline=True)
 
+            # Summary footer
             if positive_ev_outcomes:
-                total_bet = len(positive_ev_outcomes) * bet_size
-                total_expected_profit = sum(
-                    calculate_flat_bet(ev_results[o]["ev"], ev_results[o]["prob"], bet_size, threshold)["expected_profit"]
+                total_stake = sum(
+                    calculate_kelly_bet(
+                        ev_results[o]["ev"], ev_results[o]["prob"],
+                        ev_results[o]["odds"], bankroll, kelly_frac, threshold
+                    )["stake"]
                     for o in positive_ev_outcomes
                 )
+                total_expected_profit = sum(
+                    calculate_kelly_bet(
+                        ev_results[o]["ev"], ev_results[o]["prob"],
+                        ev_results[o]["odds"], bankroll, kelly_frac, threshold
+                    )["expected_profit"]
+                    for o in positive_ev_outcomes
+                )
+                total_kelly_pct = (total_stake / bankroll) * 100 if bankroll > 0 else 0
                 embed.add_field(
                     name="📋 Bet Summary",
                     value=(
                         f"**{len(positive_ev_outcomes)}** +EV outcome(s)\n"
-                        f"Total stake: `${total_bet:.2f}`\n"
-                        f"Total expected profit: `${total_expected_profit:.2f}`"
+                        f"Total stake: **${total_stake:,.2f}** ({total_kelly_pct:.1f}% of bankroll)\n"
+                        f"Total expected profit: **${total_expected_profit:,.2f}**"
                     ),
                     inline=True,
                 )
+            else:
+                embed.add_field(
+                    name="📋 Bet Summary",
+                    value="No +EV outcomes above threshold — no bets recommended.",
+                    inline=True,
+                )
 
-            embed.set_footer(text=f"Engine: {SURPLUS_MODEL} via Surplus | EV = (Prob × Odds) − 1 | Flat Bet Mode")
+            embed.set_footer(text=f"Engine: {SURPLUS_MODEL} via Surplus | Kelly: f* = EV/(odds−1) × {kelly_frac} | Max 25%/bet")
 
             print(f"[EV CMD] Sending embed...", file=sys.stderr)
             await ctx.send(embed=embed)
@@ -560,13 +638,17 @@ async def cmd_ev_status(ctx):
     """Show EV bot configuration status."""
     gid = ctx.guild.id if ctx.guild else ctx.author.id
     threshold = get_ev_threshold(gid)
-    bet_size = get_bet_size(gid)
+    kelly_frac = get_kelly_fraction(gid)
+    bankroll = get_bankroll(gid)
     api_status = "✅ Configured" if SURPLUS_API_KEY else "❌ Not set"
 
+    kelly_label = "Full-Kelly" if kelly_frac == 1.0 else f"{kelly_frac*100:.0f}%-Kelly"
+
     status_lines = [
-        f"**Mode:** Flat Bet (Analysis Only)",
+        f"**Mode:** Kelly Criterion Staking",
         f"**EV Threshold:** {threshold*100:.1f}%",
-        f"**Default Bet Size:** ${bet_size:.2f}",
+        f"**Kelly Fraction:** {kelly_frac} ({kelly_label})",
+        f"**Bankroll:** ${bankroll:,.2f}",
         f"**AI Model:** {SURPLUS_MODEL}",
         f"**Surplus API:** {api_status}",
     ]
@@ -585,10 +667,11 @@ async def cmd_ev_status(ctx):
 async def on_ready():
     print(f"[EV Bot] ========================================", file=sys.stderr)
     print(f"[EV Bot] Online: {bot.user.name} ({bot.user.id})", file=sys.stderr)
-    print(f"[EV Bot] Mode: Flat Bet (Analysis Only)", file=sys.stderr)
+    print(f"[EV Bot] Mode: Kelly Criterion Staking", file=sys.stderr)
     print(f"[EV Bot] Model: {SURPLUS_MODEL}", file=sys.stderr)
     print(f"[EV Bot] EV Threshold: {DEFAULT_EV_THRESHOLD*100:.1f}%", file=sys.stderr)
-    print(f"[EV Bot] Default Bet: ${DEFAULT_BET_SIZE_USD:.2f}", file=sys.stderr)
+    print(f"[EV Bot] Kelly Fraction: {DEFAULT_KELLY_FRACTION}", file=sys.stderr)
+    print(f"[EV Bot] Bankroll: ${DEFAULT_BANKROLL:,.2f}", file=sys.stderr)
     print(f"[EV Bot] API Key Set: {'Yes' if SURPLUS_API_KEY else 'NO — !ev will fail'}", file=sys.stderr)
     print(f"[EV Bot] ========================================", file=sys.stderr)
 
