@@ -1,13 +1,14 @@
 """
-ev_bot.py — EV-Based Polymarket Betting Bot
-============================================
+ev_bot.py — EV-Based Polymarket Betting Bot (Flat Bet / Analysis Mode)
+======================================================================
 Architecture:
   1. Gamma API      → fetch market data + clobTokenIds
   2. OpenAI (gpt-5.4) → Pydantic Structured Outputs for fundamental probabilities
   3. CLOB API       → live best-ask prices → decimal odds
   4. EV Math        → deterministic EV = (prob * odds) - 1
-  5. py-clob-client → market BUY orders when EV > threshold
+  5. Flat Bet       → displays exact bet sizing, no on-chain execution needed
 
+No private keys, no funder address, no py-clob-client required.
 Run independently alongside your existing discord_match_bot.py.
 """
 
@@ -32,8 +33,6 @@ DISCORD_TOKEN      = os.getenv("EV_BOT_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
 SURPLUS_API_KEY    = os.getenv("SURPLUS_API_KEY")
 SURPLUS_BASE_URL   = os.getenv("SURPLUS_API_URL", "https://api.surplusintelligence.ai/min30/v1")
 SURPLUS_MODEL      = os.getenv("SURPLUS_MODEL", "gpt-5.4")
-POLYMARKET_PK      = os.getenv("POLYMARKET_PRIVATE_KEY")       # hex private key for py-clob-client
-POLYMARKET_FUNDER  = os.getenv("POLYMARKET_FUNDER_ADDRESS")    # your EOA that holds USDC.e on Polygon
 DEFAULT_EV_THRESHOLD = float(os.getenv("EV_THRESHOLD", "0.05"))
 DEFAULT_BET_SIZE_USD = float(os.getenv("DEFAULT_BET_SIZE", "10.0"))
 
@@ -50,7 +49,6 @@ class MatchProbabilities(BaseModel):
     key_factors: str = Field(..., description="1-sentence summary of key fundamental factors")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Model confidence in these probabilities")
 
-# JSON Schema for OpenAI structured output (compatible with any OpenAI-compatible API)
 MATCH_PROB_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
@@ -108,7 +106,6 @@ USER_PROMPT_TEMPLATE = (
 # ── Gamma API ───────────────────────────────────────────────
 
 def fetch_event_from_gamma(slug: str) -> Optional[dict]:
-    """Fetch event details from Polymarket Gamma API."""
     url = f"https://gamma-api.polymarket.com/events?slug={slug}"
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
     try:
@@ -124,7 +121,6 @@ def fetch_event_from_gamma(slug: str) -> Optional[dict]:
 
 
 def extract_markets_from_event(event: dict) -> list[dict]:
-    """Extract home/draw/away markets with their clobTokenIds from a Gamma event."""
     markets = event.get("markets", [])
     result = []
     for m in markets:
@@ -141,11 +137,9 @@ def extract_markets_from_event(event: dict) -> list[dict]:
 
         token_id = clob_ids[0]
 
-        # Classify market type
         if "draw" in question or "tie" in question:
             market_type = "draw"
         elif "win" in question:
-            # Determine home or away
             home_name = ""
             away_name = ""
             teams = event.get("teams", [])
@@ -158,7 +152,6 @@ def extract_markets_from_event(event: dict) -> list[dict]:
             elif away_name and away_name in question:
                 market_type = "away"
             else:
-                # Fallback: first team mentioned = home
                 if home_name and any(w in question for w in home_name.split()):
                     market_type = "home"
                 elif away_name and any(w in question for w in away_name.split()):
@@ -179,7 +172,6 @@ def extract_markets_from_event(event: dict) -> list[dict]:
 
 
 def parse_polymarket_url(url: str) -> Optional[str]:
-    """Extract event slug from a Polymarket URL."""
     m = re.search(
         r'https?://polymarket\.com/(?:event|sports/[a-z0-9]+)/([a-z0-9][a-z0-9\-]+[a-z0-9])',
         url, re.IGNORECASE
@@ -190,8 +182,6 @@ def parse_polymarket_url(url: str) -> Optional[str]:
 # ── CLOB API ────────────────────────────────────────────────
 
 def fetch_clob_best_ask(token_id: str) -> Optional[float]:
-    """Fetch the best ask price for a token from Polymarket CLOB.
-    Returns the share price (0.0 to 1.0) or None."""
     url = f"https://clob.polymarket.com/price?token_id={token_id}&side=buy"
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
     try:
@@ -207,8 +197,6 @@ def fetch_clob_best_ask(token_id: str) -> Optional[float]:
 
 
 def share_price_to_decimal_odds(price: float) -> float:
-    """Convert CLOB share price (0-1) to decimal odds.
-    Decimal Odds = 1 / Share Price"""
     if price <= 0:
         return float("inf")
     return 1.0 / price
@@ -229,7 +217,6 @@ async def fetch_fundamental_probabilities(
     league: str = "Unknown",
     match_date: str = "Unknown",
 ) -> MatchProbabilities:
-    """Call OpenAI with Structured Outputs to get fundamental probabilities."""
     client = get_openai_client()
 
     user_prompt = USER_PROMPT_TEMPLATE.format(
@@ -240,7 +227,6 @@ async def fetch_fundamental_probabilities(
         match_date=match_date,
     )
 
-    # Try structured output first, fall back to raw JSON parsing
     try:
         response = await client.chat.completions.create(
             model=SURPLUS_MODEL,
@@ -257,11 +243,8 @@ async def fetch_fundamental_probabilities(
             raise ValueError("empty response")
 
         data = json.loads(raw)
-
-        # Validate sum
         total = data["home_win"] + data["draw"] + data["away_win"]
         if abs(total - 1.0) > 0.001:
-            # Normalize
             data["home_win"] /= total
             data["draw"] /= total
             data["away_win"] /= total
@@ -270,7 +253,6 @@ async def fetch_fundamental_probabilities(
 
     except Exception as e:
         print(f"[OpenAI] Structured output failed ({e}), falling back to raw JSON parsing", file=sys.stderr)
-        # Fallback: raw completion + manual parsing
         response = await client.chat.completions.create(
             model=SURPLUS_MODEL,
             messages=[
@@ -285,22 +267,17 @@ async def fetch_fundamental_probabilities(
 
 
 def _parse_raw_probabilities(raw: str) -> MatchProbabilities:
-    """Fallback parser for when structured outputs aren't supported."""
-    # Extract JSON from response
     json_str = raw
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL | re.IGNORECASE)
     if m:
         json_str = m.group(1).strip()
 
-    # Find JSON object
     start = json_str.find("{")
     end = json_str.rfind("}")
     if start >= 0 and end > start:
         json_str = json_str[start:end+1]
 
     data = json.loads(json_str)
-
-    # Normalize
     total = data.get("home_win", 0) + data.get("draw", 0) + data.get("away_win", 0)
     if total > 0 and abs(total - 1.0) > 0.001:
         data["home_win"] = data.get("home_win", 0) / total
@@ -325,11 +302,6 @@ def calculate_ev(
     probs: MatchProbabilities,
     clob_prices: dict[str, Optional[float]],
 ) -> dict:
-    """Calculate Expected Value for each outcome.
-    EV = (AI Probability * Decimal Odds) - 1
-
-    Returns dict with EV values and decision flags.
-    """
     results = {
         "home": {"prob": probs.home_win, "price": None, "odds": None, "ev": None, "token_id": None},
         "draw": {"prob": probs.draw, "price": None, "odds": None, "ev": None, "token_id": None},
@@ -350,91 +322,38 @@ def calculate_ev(
     return results
 
 
-# ── py-clob-client Execution ────────────────────────────────
+# ── Flat Bet Sizing ─────────────────────────────────────────
 
-def get_clob_client():
-    """Initialize py-clob-client. Returns None if not configured."""
-    try:
-        from py_clob_client.client import ClobClient
-    except ImportError:
-        print("[CLOB Client] py-clob-client not installed. Run: pip install py-clob-client", file=sys.stderr)
-        return None
-
-    if not POLYMARKET_PK:
-        print("[CLOB Client] POLYMARKET_PRIVATE_KEY not set", file=sys.stderr)
-        return None
-
-    funder = POLYMARKET_FUNDER or None
-
-    try:
-        client = ClobClient(
-            host="https://clob.polymarket.com",
-            key=POLYMARKET_PK,
-            chain_id=137,       # Polygon
-            signature_type=1,   # EOA
-            funder=funder,
-        )
-        # Create API credentials if needed
-        try:
-            creds = client.create_api_key()
-            print(f"[CLOB Client] API credentials created", file=sys.stderr)
-        except Exception:
-            # May already exist
-            pass
-        return client
-    except Exception as e:
-        print(f"[CLOB Client] Failed to initialize: {e}", file=sys.stderr)
-        return None
-
-
-def place_market_buy_order(token_id: str, bet_amount_usd: float) -> Optional[dict]:
-    """Place a market BUY order on Polymarket CLOB.
+def calculate_flat_bet(
+    ev: float,
+    prob: float,
+    bet_size: float,
+    threshold: float,
+) -> Optional[dict]:
+    """Calculate flat bet sizing for a +EV outcome.
     
-    Args:
-        token_id: The clobTokenId for the outcome
-        bet_amount_usd: Dollar amount to bet (used to calculate share count)
-    
-    Returns order response dict or None on failure.
+    Returns dict with bet details or None if EV below threshold.
     """
-    try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs
-        from py_clob_client.order_builder.constants import BUY
-    except ImportError:
-        return {"error": "py-clob-client not installed"}
+    if ev < threshold:
+        return None
 
-    client = get_clob_client()
-    if client is None:
-        return {"error": "CLOB client not configured — check POLYMARKET_PRIVATE_KEY"}
+    # Flat bet: fixed dollar amount
+    # Expected profit = bet_size * ev
+    expected_profit = bet_size * ev
 
-    # Get current best ask price
-    price = fetch_clob_best_ask(token_id)
-    if price is None or price <= 0:
-        return {"error": f"Could not fetch price for token {token_id}"}
+    # Kelly fraction for reference (informational only)
+    # f = ev / (odds - 1)  — but we use flat bet, not Kelly
+    kelly_fraction = None
+    if ev > 0:
+        # Conservative: half-Kelly for reference
+        kelly_fraction = ev / 2
 
-    # Calculate shares: shares = bet_amount / price_per_share
-    shares = bet_amount_usd / price
-
-    try:
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=price,
-            size=shares,
-            side=BUY,
-        )
-        signed_order = client.create_order(order_args)
-        response = client.post_order(signed_order)
-        return {
-            "success": True,
-            "token_id": token_id,
-            "price": price,
-            "shares": shares,
-            "bet_amount": bet_amount_usd,
-            "order_id": response.get("orderID") or response.get("id"),
-            "response": response,
-        }
-    except Exception as e:
-        return {"error": str(e), "token_id": token_id}
+    return {
+        "bet_amount": bet_size,
+        "expected_profit": expected_profit,
+        "expected_roi_pct": ev * 100,
+        "kelly_reference": kelly_fraction,
+    }
 
 
 # ── Discord Bot ─────────────────────────────────────────────
@@ -443,8 +362,8 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Per-guild EV threshold
 ev_thresholds = {}
+bet_sizes = {}
 
 
 def get_ev_threshold(guild_id: int) -> float:
@@ -455,25 +374,32 @@ def set_ev_threshold(guild_id: int, threshold: float):
     ev_thresholds[guild_id] = threshold
 
 
+def get_bet_size(guild_id: int) -> float:
+    return bet_sizes.get(guild_id, DEFAULT_BET_SIZE_USD)
+
+
+def set_bet_size(guild_id: int, size: float):
+    bet_sizes[guild_id] = size
+
+
 @bot.command(name="ev")
 async def cmd_ev(ctx, *, args: str = ""):
-    """Analyze a Polymarket football event and calculate EV.
+    """Analyze a Polymarket football event and calculate EV with flat bet sizing.
     
     Usage:
-      !ev <polymarket_url>
-      !ev <polymarket_url> --bet <amount>
-      !ev <polymarket_url> --auto
-    
-    --bet <amount>: Place bets on all +EV outcomes with specified USD amount each
-    --auto: Auto-bet default amount ($10) on all +EV outcomes
+      !ev <polymarket_url>                    — Full analysis with EV + flat bet sizing
+      !ev <polymarket_url> --bet <amount>     — Use custom bet size for sizing display
+      !ev threshold <0.05>                    — Set EV threshold
+      !ev betsize <25>                        — Set default flat bet size in USD
     """
     if not args:
         await ctx.send(
-            "**EV Bot Usage:**\n"
-            "`!ev <polymarket_url>` — Analyze match and show EV\n"
-            "`!ev <polymarket_url> --bet <amount>` — Bet $X on each +EV outcome\n"
-            "`!ev <polymarket_url> --auto` — Auto-bet $10 on each +EV outcome\n"
-            "`!ev threshold <0.05>` — Set EV threshold"
+            "**EV Bot — Flat Bet Analysis**\n"
+            "`!ev <polymarket_url>` — Analyze match, show EV + flat bet sizing\n"
+            "`!ev <polymarket_url> --bet <amount>` — Custom bet size for this analysis\n"
+            "`!ev threshold <0.05>` — Set EV threshold (e.g. 0.05 = 5%)\n"
+            "`!ev betsize <25>` — Set default flat bet size in USD\n"
+            "`!evstatus` — Show current config"
         )
         return
 
@@ -491,20 +417,26 @@ async def cmd_ev(ctx, *, args: str = ""):
             await ctx.send("❌ Invalid threshold. Use: `!ev threshold 0.05`")
             return
 
-    # ── Parse args ──
-    bet_mode = False
-    bet_amount = DEFAULT_BET_SIZE_USD
-    auto_mode = False
+    # ── Handle bet size setting ──
+    if args.lower().startswith("betsize"):
+        try:
+            parts = args.split()
+            if len(parts) >= 2:
+                new_size = float(parts[1])
+                gid = ctx.guild.id if ctx.guild else ctx.author.id
+                set_bet_size(gid, new_size)
+                await ctx.send(f"✅ Default flat bet size set to **${new_size:.2f}**")
+                return
+        except ValueError:
+            await ctx.send("❌ Invalid bet size. Use: `!ev betsize 25`")
+            return
 
-    if "--auto" in args:
-        auto_mode = True
-        bet_mode = True
-        args = args.replace("--auto", "").strip()
+    # ── Parse args ──
+    custom_bet_size = None
 
     bet_match = re.search(r'--bet\s+(\d+(?:\.\d+)?)', args)
     if bet_match:
-        bet_amount = float(bet_match.group(1))
-        bet_mode = True
+        custom_bet_size = float(bet_match.group(1))
         args = args.replace(bet_match.group(0), "").strip()
 
     url = args.strip()
@@ -527,7 +459,6 @@ async def cmd_ev(ctx, *, args: str = ""):
         home_team = teams[0].get("name", "Home") if len(teams) >= 1 else "Home"
         away_team = teams[1].get("name", "Away") if len(teams) >= 2 else "Away"
 
-        # Extract league/series info
         series = event.get("series", [])
         league = "Unknown"
         if isinstance(series, list) and len(series) > 0:
@@ -535,7 +466,6 @@ async def cmd_ev(ctx, *, args: str = ""):
         elif isinstance(event.get("sport"), dict):
             league = event["sport"].get("sport", "Unknown").upper()
 
-        # Match date
         match_date = event.get("startDate") or event.get("scheduledStart") or "Unknown"
 
         # ── Step 2: Extract markets ──
@@ -544,7 +474,6 @@ async def cmd_ev(ctx, *, args: str = ""):
             await ctx.send(f"❌ Could not find enough markets (home/draw/away) for this event. Found: {len(markets)}")
             return
 
-        # Build market lookup
         market_lookup = {}
         for m in markets:
             market_lookup[m["type"]] = m
@@ -580,6 +509,7 @@ async def cmd_ev(ctx, *, args: str = ""):
         ev_results = calculate_ev(probs, clob_prices)
         gid = ctx.guild.id if ctx.guild else ctx.author.id
         threshold = get_ev_threshold(gid)
+        bet_size = custom_bet_size or get_bet_size(gid)
 
         # ── Build Discord Embed ──
         embed = discord.Embed(
@@ -596,8 +526,9 @@ async def cmd_ev(ctx, *, args: str = ""):
         ]
         embed.add_field(name="AI Fundamental Probabilities", value="\n".join(prob_lines), inline=False)
 
-        # CLOB Prices + EV
+        # CLOB Prices + EV + Flat Bet Sizing
         ev_lines = []
+        bet_lines = []
         positive_ev_outcomes = []
 
         for outcome, label, emoji in [
@@ -611,8 +542,17 @@ async def cmd_ev(ctx, *, args: str = ""):
             ev_str = f"{r['ev']*100:+.1f}%" if r["ev"] is not None else "N/A"
 
             if r["ev"] is not None and r["ev"] >= threshold:
-                ev_lines.append(f"✅ {emoji} **{label}**: Price {price_str} | Odds {odds_str} | EV **{ev_str}** ← +EV")
+                ev_lines.append(f"✅ {emoji} **{label}**: Price {price_str} | Odds {odds_str} | EV **{ev_str}**")
                 positive_ev_outcomes.append(outcome)
+
+                # Flat bet sizing
+                flat = calculate_flat_bet(r["ev"], r["prob"], bet_size, threshold)
+                if flat:
+                    bet_lines.append(
+                        f"{emoji} **{label}**: Bet `${flat['bet_amount']:.2f}` → "
+                        f"Expected profit `${flat['expected_profit']:.2f}` "
+                        f"({flat['expected_roi_pct']:+.1f}% ROI)"
+                    )
             elif r["ev"] is not None:
                 ev_lines.append(f"❌ {emoji} **{label}**: Price {price_str} | Odds {odds_str} | EV {ev_str}")
             else:
@@ -624,58 +564,37 @@ async def cmd_ev(ctx, *, args: str = ""):
             inline=False,
         )
 
+        if bet_lines:
+            embed.add_field(
+                name=f"💰 Flat Bet Sizing (${bet_size:.2f} per +EV outcome)",
+                value="\n".join(bet_lines),
+                inline=False,
+            )
+
         # Key factors
         embed.add_field(name="Key Factors", value=probs.key_factors, inline=False)
         embed.add_field(name="AI Confidence", value=f"{probs.confidence*100:.0f}%", inline=True)
 
-        embed.set_footer(text=f"Engine: {SURPLUS_MODEL} via Surplus | EV = (Prob × Odds) − 1")
-
-        await ctx.send(embed=embed)
-
-        # ── Step 6: Execution (if --bet or --auto) ──
-        if bet_mode and positive_ev_outcomes:
-            if not POLYMARKET_PK:
-                await ctx.send(
-                    "⚠️ **Cannot place bets**: `POLYMARKET_PRIVATE_KEY` not set.\n"
-                    "Set it in your environment variables to enable execution."
-                )
-                return
-
-            await ctx.send(f"⚡ **Placing bets** (${bet_amount:.2f} each on +EV outcomes)...")
-
-            for outcome in positive_ev_outcomes:
-                m = market_lookup.get(outcome)
-                if not m:
-                    continue
-
-                label = {"home": probs.home_team, "draw": "Draw", "away": probs.away_team}[outcome]
-                ev_val = ev_results[outcome]["ev"]
-
-                result = await asyncio.to_thread(place_market_buy_order, m["token_id"], bet_amount)
-
-                if result and result.get("success"):
-                    await ctx.send(
-                        f"✅ **Bet placed: {label}**\n"
-                        f"• Amount: `${bet_amount:.2f}` → `{result['shares']:.2f}` shares @ `{result['price']*100:.1f}¢`\n"
-                        f"• EV: `{ev_val*100:+.1f}%`\n"
-                        f"• Order ID: `{result['order_id']}`"
-                    )
-                else:
-                    error_msg = result.get("error", "Unknown error") if result else "No result"
-                    await ctx.send(f"❌ **Bet failed: {label}** — {error_msg}")
-
-        elif bet_mode and not positive_ev_outcomes:
-            await ctx.send("ℹ️ No outcomes exceed the EV threshold — no bets placed.")
-
-        elif not bet_mode and positive_ev_outcomes:
-            outcomes_str = ", ".join(
-                {"home": probs.home_team, "draw": "Draw", "away": probs.away_team}[o]
+        # Summary footer
+        if positive_ev_outcomes:
+            total_bet = len(positive_ev_outcomes) * bet_size
+            total_expected_profit = sum(
+                calculate_flat_bet(ev_results[o]["ev"], ev_results[o]["prob"], bet_size, threshold)["expected_profit"]
                 for o in positive_ev_outcomes
             )
-            await ctx.send(
-                f"💡 **+EV opportunities detected**: {outcomes_str}\n"
-                f"Bet with: `!ev {url} --bet {DEFAULT_BET_SIZE_USD}` or `!ev {url} --auto`"
+            embed.add_field(
+                name="📋 Bet Summary",
+                value=(
+                    f"**{len(positive_ev_outcomes)}** +EV outcome(s)\n"
+                    f"Total stake: `${total_bet:.2f}`\n"
+                    f"Total expected profit: `${total_expected_profit:.2f}`"
+                ),
+                inline=True,
             )
+
+        embed.set_footer(text=f"Engine: {SURPLUS_MODEL} via Surplus | EV = (Prob × Odds) − 1 | Flat Bet Mode")
+
+        await ctx.send(embed=embed)
 
 
 @bot.command(name="evstatus")
@@ -683,32 +602,21 @@ async def cmd_ev_status(ctx):
     """Show EV bot configuration status."""
     gid = ctx.guild.id if ctx.guild else ctx.author.id
     threshold = get_ev_threshold(gid)
-
-    pk_status = "✅ Configured" if POLYMARKET_PK else "❌ Not set"
-    funder_status = POLYMARKET_FUNDER or "Not set (using derived address)"
+    bet_size = get_bet_size(gid)
     api_status = "✅ Configured" if SURPLUS_API_KEY else "❌ Not set"
 
-    clob_available = False
-    try:
-        import py_clob_client
-        clob_available = True
-    except ImportError:
-        pass
-
     status_lines = [
+        f"**Mode:** Flat Bet (Analysis Only — no on-chain execution)",
         f"**EV Threshold:** {threshold*100:.1f}%",
+        f"**Default Bet Size:** ${bet_size:.2f}",
         f"**AI Model:** {SURPLUS_MODEL}",
         f"**Surplus API:** {api_status}",
-        f"**Private Key:** {pk_status}",
-        f"**Funder Address:** {funder_status}",
-        f"**py-clob-client:** {'✅ Installed' if clob_available else '❌ Not installed'}",
-        f"**Default Bet Size:** ${DEFAULT_BET_SIZE_USD:.2f}",
     ]
 
     embed = discord.Embed(
         title="EV Bot Status",
         description="\n".join(status_lines),
-        color=discord.Color.green() if POLYMARKET_PK and SURPLUS_API_KEY else discord.Color.orange(),
+        color=discord.Color.green() if SURPLUS_API_KEY else discord.Color.orange(),
     )
     await ctx.send(embed=embed)
 
@@ -718,16 +626,10 @@ async def cmd_ev_status(ctx):
 @bot.event
 async def on_ready():
     print(f"[EV Bot] Online: {bot.user.name} ({bot.user.id})")
+    print(f"[EV Bot] Mode: Flat Bet (Analysis Only)")
     print(f"[EV Bot] Model: {SURPLUS_MODEL}")
     print(f"[EV Bot] EV Threshold: {DEFAULT_EV_THRESHOLD*100:.1f}%")
     print(f"[EV Bot] Default Bet: ${DEFAULT_BET_SIZE_USD:.2f}")
-    print(f"[EV Bot] PK Configured: {'Yes' if POLYMARKET_PK else 'No'}")
-    print(f"[EV Bot] py-clob-client: ", end="")
-    try:
-        import py_clob_client
-        print("Installed")
-    except ImportError:
-        print("Not installed — run: pip install py-clob-client")
 
 
 @bot.event
