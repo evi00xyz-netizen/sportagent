@@ -81,6 +81,63 @@ def fetch_event_from_gamma(slug: str) -> dict:
         print(f"[Gamma API] Event lookup failed for slug '{slug}': {e}", file=sys.stderr)
     return None
 
+# ── sport detection from Gamma API event ────────────────────
+# Maps Gamma API sport codes and tag labels to our internal sport names.
+_GAMMA_SPORT_MAP = {
+    # sport.sport field
+    "mlb": "mlb", "nba": "nba", "nfl": "nfl", "nhl": "nhl",
+    "epl": "soccer", "laliga": "soccer", "seriea": "soccer",
+    "bundesliga": "soccer", "ligue1": "soccer", "mls": "soccer",
+    "ucl": "soccer", "uel": "soccer", "kor": "soccer",
+    "j1": "soccer", "eredivisie": "soccer", "liga": "soccer",
+    "bra": "soccer", "arg": "soccer", "afl": "afl",
+    "ncaa": "ncaa", "ncaaf": "ncaa", "ncaab": "ncaa",
+    "wnba": "wnba", "cricket": "cricket", "tennis": "tennis",
+    "mma": "mma", "boxing": "boxing", "f1": "f1",
+    # tag labels (lowercase)
+    "soccer": "soccer", "baseball": "mlb", "basketball": "nba",
+    "football": "nfl", "hockey": "nhl", "k-league": "soccer",
+    "premier league": "soccer", "la liga": "soccer",
+    "serie a": "soccer", "bundesliga": "soccer",
+    "ligue 1": "soccer", "mls": "soccer",
+    "champions league": "soccer", "europa league": "soccer",
+    "tennis": "tennis", "cricket": "cricket",
+    "mma": "mma", "boxing": "boxing", "formula 1": "f1",
+    "afl": "afl", "ncaa": "ncaa", "wnba": "wnba",
+}
+
+def detect_sport_from_gamma_event(event: dict) -> str:
+    """Extract the sport from a Gamma API event object.
+    Uses sport.sport field, seriesSlug, and tags — in that priority order."""
+    if not event or not isinstance(event, dict):
+        return "unknown"
+
+    # Priority 1: sport.sport field (most reliable)
+    sport_obj = event.get("sport")
+    if isinstance(sport_obj, dict):
+        sport_code = sport_obj.get("sport", "").lower().strip()
+        if sport_code and sport_code in _GAMMA_SPORT_MAP:
+            return _GAMMA_SPORT_MAP[sport_code]
+
+    # Priority 2: seriesSlug
+    series_slug = event.get("seriesSlug", "").lower().strip()
+    if series_slug and series_slug in _GAMMA_SPORT_MAP:
+        return _GAMMA_SPORT_MAP[series_slug]
+
+    # Priority 3: tags
+    tags = event.get("tags", [])
+    if isinstance(tags, list):
+        for tag in tags:
+            if isinstance(tag, dict):
+                label = tag.get("label", "").lower().strip()
+                if label and label in _GAMMA_SPORT_MAP:
+                    return _GAMMA_SPORT_MAP[label]
+                slug = tag.get("slug", "").lower().strip()
+                if slug and slug in _GAMMA_SPORT_MAP:
+                    return _GAMMA_SPORT_MAP[slug]
+
+    return "unknown"
+
 # ── bullpen CLI wrapper & watcher state ─────────────────────
 def load_watcher_config() -> dict:
     defaults = {
@@ -777,7 +834,7 @@ async def bullpen_watcher_loop():
         sleep_time = max(0.1, configured_interval - elapsed)
         await asyncio.sleep(sleep_time)
 
-# ── sport detection ─────────────────────────────────────────
+# ── sport detection (text-based fallback) ───────────────────
 NO_DRAW_SPORTS = {"mlb", "nba", "nfl", "nhl", "baseball", "basketball", "football", "hockey",
                   "american football", "ice hockey"}
 
@@ -822,6 +879,8 @@ TEAM_SPORT_MAP = {
 }
 
 def detect_sport(match_query: str) -> str:
+    """Detect sport from a text match query. This is a fallback — when Gamma API
+    data is available, use detect_sport_from_gamma_event() instead."""
     query_lower = match_query.lower()
     for sport in NO_DRAW_SPORTS:
         if sport in query_lower:
@@ -882,8 +941,9 @@ USER_PROMPT_TEMPLATE = (
     "- match_name/home_team/away_team: team names only, no extra words."
 )
 
-def build_user_prompt(match_query: str) -> str:
-    sport = detect_sport(match_query)
+def build_user_prompt(match_query: str, sport: str = None) -> str:
+    if sport is None:
+        sport = detect_sport(match_query)
     draws_possible = sport_has_draws(sport)
     if draws_possible:
         draw_rule = ""
@@ -990,10 +1050,11 @@ def get_surplus_client() -> AsyncOpenAI:
         raise Exception("SURPLUS_API_KEY not set")
     return AsyncOpenAI(api_key=SURPLUS_API_KEY, base_url=SURPLUS_BASE_URL)
 
-async def fetch_true_probabilities(match_query: str) -> dict:
+async def fetch_true_probabilities(match_query: str, sport: str = None) -> dict:
     client = get_surplus_client()
-    sport = detect_sport(match_query)
-    user_prompt = build_user_prompt(match_query)
+    if sport is None:
+        sport = detect_sport(match_query)
+    user_prompt = build_user_prompt(match_query, sport)
     response = await client.chat.completions.create(
         model=SURPLUS_MODEL,
         messages=[
@@ -1176,6 +1237,7 @@ async def cmd_match(ctx, *, args: str):
         oh = od = oa = None
         polymarket_slug = None
         gamma_event = None
+        detected_sport = None
 
         # ── detect polymarket url ────────────────────────────
         slug_from_url = extract_slug_from_url(match_query)
@@ -1186,6 +1248,10 @@ async def cmd_match(ctx, *, args: str):
             # Fetch event details from Gamma API
             gamma_event = await asyncio.to_thread(fetch_event_from_gamma, polymarket_slug)
             if gamma_event:
+                # ── extract exact sport from Gamma API ───────
+                detected_sport = detect_sport_from_gamma_event(gamma_event)
+                print(f"[!match] Gamma sport detected: {detected_sport}", file=sys.stderr)
+
                 title = gamma_event.get("title", "")
                 teams = gamma_event.get("teams", [])
                 if len(teams) >= 2:
@@ -1194,7 +1260,7 @@ async def cmd_match(ctx, *, args: str):
                     match_query = f"{home_team} vs. {away_team}"
                 elif title:
                     match_query = title.replace(" vs. ", " vs ")
-                print(f"[!match] Gamma event resolved: {match_query} (slug: {polymarket_slug})", file=sys.stderr)
+                print(f"[!match] Gamma event resolved: {match_query} (slug: {polymarket_slug}, sport: {detected_sport})", file=sys.stderr)
             else:
                 await ctx.send(f"❌ Could not find event for slug `{polymarket_slug}` on Polymarket.")
                 return
@@ -1216,11 +1282,14 @@ async def cmd_match(ctx, *, args: str):
 
         gid = ctx.guild.id if ctx.guild else ctx.author.id
         min_edge = get_min_edge(gid)
-        sport = detect_sport(match_query)
-        has_draws = sport_has_draws(sport)
+
+        # ── use Gamma API sport if available, else fallback to text detection ──
+        if detected_sport is None:
+            detected_sport = detect_sport(match_query)
+        has_draws = sport_has_draws(detected_sport)
 
         try:
-            data = await fetch_true_probabilities(match_query)
+            data = await fetch_true_probabilities(match_query, detected_sport)
         except APIStatusError as e:
             await ctx.send(
                 f"**Surplus API error** (status {e.status_code}):\n"
@@ -1240,8 +1309,28 @@ async def cmd_match(ctx, *, args: str):
         fc  = data.get("forecast", "N/A")
         src = f"Surplus ({SURPLUS_MODEL})"
 
+        # ── display sport label: use Gamma API sport name if available ──
+        sport_display = detected_sport.upper()
+        if gamma_event:
+            sport_obj = gamma_event.get("sport", {})
+            if isinstance(sport_obj, dict):
+                series_slug = gamma_event.get("seriesSlug", "")
+                if series_slug:
+                    sport_display = series_slug.upper().replace("-", " ")
+            # Also check tags for a nicer label
+            tags = gamma_event.get("tags", [])
+            if isinstance(tags, list):
+                for tag in tags:
+                    if isinstance(tag, dict):
+                        label = tag.get("label", "")
+                        if label.lower() in ("soccer", "k-league", "premier league", "la liga",
+                                             "serie a", "bundesliga", "ligue 1", "mls",
+                                             "champions league", "europa league"):
+                            sport_display = label.upper()
+                            break
+
         embed = discord.Embed(
-            title=f"Matrix: {data.get('match_name', match_query)} ({sport.upper()})",
+            title=f"Matrix: {data.get('match_name', match_query)} ({sport_display})",
             color=discord.Color.blue()
         )
 
