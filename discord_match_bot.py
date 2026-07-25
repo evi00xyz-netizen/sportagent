@@ -837,63 +837,15 @@ def calculate_edges(true_probs: dict, odds_home: float = None, odds_draw: float 
 # ── discord button view for !match ──────────────────────────
 
 class MatchActionView(discord.ui.View):
-    def __init__(self, match_query: str):
+    def __init__(self):
         super().__init__(timeout=180)
-        self.match_query = match_query
-
-    @discord.ui.button(label="🔄 Refresh Analysis", style=discord.ButtonStyle.primary, custom_id="btn_refresh_match")
-    async def refresh_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(thinking=True)
-        try:
-            data = await fetch_true_probabilities(self.match_query)
-            sport = detect_sport(self.match_query)
-            has_draws = sport_has_draws(sport)
-            tp = data["true_probabilities"]
-            mf = data["matrix_factors"]
-            fc = data.get("forecast", "N/A")
-
-            embed = discord.Embed(
-                title=f"Matrix: {data.get('match_name', self.match_query)} ({sport.upper()})",
-                color=discord.Color.blue()
-            )
-            probs_text = f"**{data.get('home_team','Home')}**: {tp['home_win']*100:.1f}%\n"
-            if has_draws:
-                probs_text += f"**Draw**: {tp.get('draw',0)*100:.1f}%\n"
-            probs_text += f"**{data.get('away_team','Away')}**: {tp['away_win']*100:.1f}%"
-
-            embed.add_field(name="True Probabilities (Refreshed)", value=_trunc(probs_text), inline=False)
-            embed.add_field(name="Forecast", value=_trunc(fc), inline=False)
-
-            factor_lines = [
-                f"Home form: {mf.get('home_form','?')}",
-                f"Away form: {mf.get('away_form','?')}",
-                f"Home absences: {mf.get('home_absences','none')}",
-                f"Away absences: {mf.get('away_absences','none')}",
-                f"Tactical edge: {mf.get('tactical_edge','none')}"
-            ]
-            embed.add_field(name="Factors", value=_trunc("\n".join(factor_lines)), inline=False)
-            embed.set_footer(text=f"Engine: Surplus ({SURPLUS_MODEL}) | confidence: {data.get('confidence','?')}")
-
-            await interaction.followup.send(embed=embed, view=MatchActionView(self.match_query))
-        except Exception as e:
-            await interaction.followup.send(f"❌ Refresh failed: {e}", ephemeral=True)
 
     @discord.ui.button(label="📊 Open Positions", style=discord.ButtonStyle.secondary, custom_id="btn_open_positions")
     async def positions_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(thinking=True)
         try:
             output = await fetch_positions_output()
-            header, pos_objs = parse_positions_to_cards(output)
-            if pos_objs:
-                cards = [format_card_from_obj(p) for p in pos_objs[:5]]
-                embed = discord.Embed(
-                    title="📊 Active Open Positions",
-                    description="\n\n".join(cards),
-                    color=discord.Color.gold()
-                )
-            else:
-                embed = discord.Embed(title="📊 Open Positions", description=header or "No open positions found.", color=discord.Color.gold())
-            await interaction.followup.send(embed=embed)
+            await send_positions_embeds(interaction.followup, "Bullpen Polymarket Positions", output)
         except Exception as e:
             await interaction.followup.send(f"❌ Failed to fetch positions: {e}", ephemeral=True)
 
@@ -1127,7 +1079,7 @@ async def cmd_match(ctx, *, args: str):
                 )
 
         embed.set_footer(text=f"Engine: {src}  |  min edge: {min_edge*100:.1f}%  |  confidence: {data.get('confidence','?')}")
-        view = MatchActionView(match_query)
+        view = MatchActionView()
         await ctx.send(embed=embed, view=view)
 
 # ── event listeners ─────────────────────────────────────────
