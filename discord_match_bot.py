@@ -49,14 +49,18 @@ def set_min_edge(guild_id: int, edge: float):
     user_settings[guild_id]["min_edge"] = edge
 
 # ── polymarket url parsing ──────────────────────────────────
+# Matches BOTH URL formats:
+#   https://polymarket.com/event/kor-poh-jeo-2026-07-25
+#   https://polymarket.com/sports/swe/swe-deg-dju-2026-07-25
+#   https://polymarket.com/event/kor-poh-jeo-2026-07-25#Fr9J4hbu
 _POLYMARKET_URL_RE = re.compile(
-    r'https?://polymarket\.com/event/([a-z0-9][a-z0-9\-]+[a-z0-9])',
+    r'https?://polymarket\.com/(?:event|sports/[a-z]+)/([a-z0-9][a-z0-9\-]+[a-z0-9])',
     re.IGNORECASE
 )
 
 def extract_slug_from_url(url: str) -> str:
-    """Extract the event slug from a Polymarket URL like
-    https://polymarket.com/event/kor-poh-jeo-2026-07-25#Fr9J4hbu"""
+    """Extract the event slug from a Polymarket URL.
+    Handles both /event/... and /sports/<category>/... formats."""
     m = _POLYMARKET_URL_RE.search(url)
     if m:
         return m.group(1)
@@ -94,6 +98,7 @@ _GAMMA_SPORT_MAP = {
     "ncaa": "ncaa", "ncaaf": "ncaa", "ncaab": "ncaa",
     "wnba": "wnba", "cricket": "cricket", "tennis": "tennis",
     "mma": "mma", "boxing": "boxing", "f1": "f1",
+    "swe": "soccer",  # Swedish league
     # tag labels (lowercase)
     "soccer": "soccer", "baseball": "mlb", "basketball": "nba",
     "football": "nfl", "hockey": "nhl", "k-league": "soccer",
@@ -107,12 +112,9 @@ _GAMMA_SPORT_MAP = {
 }
 
 # ── INDIVIDUAL SPORTS ───────────────────────────────────────
-# Sports where the prompt should use player1/player2 framing
-# instead of home/away team framing.
 INDIVIDUAL_SPORTS = {"tennis", "mma", "boxing", "f1"}
 
 def sport_has_draws(sport: str) -> bool:
-    """Sports without draws: MLB, NBA, NFL, NHL, and all individual sports."""
     no_draw = {"mlb", "nba", "nfl", "nhl", "tennis", "mma", "boxing", "f1"}
     return sport not in no_draw
 
@@ -120,24 +122,20 @@ def is_individual_sport(sport: str) -> bool:
     return sport in INDIVIDUAL_SPORTS
 
 def detect_sport_from_gamma_event(event: dict) -> str:
-    """Extract the sport from a Gamma API event object.
-    Uses sport.sport field, seriesSlug, and tags — in that priority order."""
+    """Extract the sport from a Gamma API event object."""
     if not event or not isinstance(event, dict):
         return "unknown"
 
-    # Priority 1: sport.sport field (most reliable)
     sport_obj = event.get("sport")
     if isinstance(sport_obj, dict):
         sport_code = sport_obj.get("sport", "").lower().strip()
         if sport_code and sport_code in _GAMMA_SPORT_MAP:
             return _GAMMA_SPORT_MAP[sport_code]
 
-    # Priority 2: seriesSlug
     series_slug = event.get("seriesSlug", "").lower().strip()
     if series_slug and series_slug in _GAMMA_SPORT_MAP:
         return _GAMMA_SPORT_MAP[series_slug]
 
-    # Priority 3: tags
     tags = event.get("tags", [])
     if isinstance(tags, list):
         for tag in tags:
@@ -200,7 +198,6 @@ bullpen_watch_state["task"] = None
 last_periodic_time = 0
 
 def get_bullpen_binary_path() -> str:
-    """Finds the absolute path to the valid bullpen executable."""
     priority_paths = [
         "/root/.bullpen/bin/bullpen",
         os.path.expanduser("~/.bullpen/bin/bullpen"),
@@ -208,23 +205,16 @@ def get_bullpen_binary_path() -> str:
     for p in priority_paths:
         if os.path.exists(p) and os.access(p, os.X_OK):
             return p
-
     candidate = shutil.which("bullpen")
     if candidate and candidate != "/usr/local/bin/bullpen":
         return candidate
-
-    fallback_paths = [
-        "/usr/local/bin/bullpen",
-        "/usr/bin/bullpen"
-    ]
+    fallback_paths = ["/usr/local/bin/bullpen", "/usr/bin/bullpen"]
     for p in fallback_paths:
         if os.path.exists(p) and os.access(p, os.X_OK):
             return p
-
     return "bullpen"
 
 def run_bullpen_positions(address: str = None, source: str = None, json_mode: bool = False) -> str:
-    """Executes the `bullpen polymarket positions` CLI command via subprocess."""
     bin_path = get_bullpen_binary_path()
     cmd_parts = [bin_path, "polymarket", "positions"]
     if json_mode:
@@ -233,12 +223,10 @@ def run_bullpen_positions(address: str = None, source: str = None, json_mode: bo
         cmd_parts.extend(["--address", address])
     if source:
         cmd_parts.extend(["--source", source])
-
     env = os.environ.copy()
     bullpen_bin_dir = os.path.expanduser("~/.bullpen/bin")
     if os.path.exists(bullpen_bin_dir):
         env["PATH"] = f"{bullpen_bin_dir}:{env.get('PATH', '')}"
-
     try:
         res = subprocess.run(cmd_parts, capture_output=True, text=True, check=True, timeout=10, env=env)
         return res.stdout.strip()
@@ -253,103 +241,64 @@ def run_bullpen_positions(address: str = None, source: str = None, json_mode: bo
         return f"[Error] Failed to execute bullpen CLI: {e}"
 
 # ── TICKER EXTRACTION ───────────────────────────────────────
-# Handles ALL Polymarket ticker formats:
-#   MLB: mlb-kc-det-2026-07-24   (3-letter teams)
-#   NBA: nba-lal-bos-2026-06-15   (3-letter teams)
-#   Tennis: atp-dedurap-onclin-2026-07-25  (variable-length player names)
-#   Soccer: kor-poh-jeo-2026-07-25  (3-letter teams)
-#
-# Format: SPORT-NAME1-NAME2-YYYY-MM-DD where each name is 2-15 alphanumeric chars.
 _TICKER_RE = re.compile(
     r'\b([a-z]{2,15}-[a-z]{2,15}-[a-z]{2,15}-\d{4}-\d{2}-\d{2})\b',
     re.IGNORECASE
 )
-
-# Broader catch-all for ANY ticker-looking pattern in "Did you mean:" parentheticals.
-# Matches: (atp-dedurap-onclin-2026-07-25), (mlb-who-will-win-...), etc.
 _PAREN_TICKER_RE = re.compile(
     r'\(([a-z][a-z0-9\-]{5,}[a-z0-9])\)',
     re.IGNORECASE
 )
 
 def _extract_all_tickers(text: str, exclude_slug: str = None) -> list[str]:
-    """Extract ALL possible Polymarket tickers/slugs from combined CLI output.
-    Uses multiple regex patterns to catch every format.
-    Returns deduplicated list, excluding the original slug that failed."""
     candidates = []
-
-    # Pattern 1: Structured sport tickers with date (atp-dedurap-onclin-2026-07-25)
     for m in _TICKER_RE.finditer(text):
         ticker = m.group(1).lower()
         if ticker not in candidates:
             candidates.append(ticker)
-
-    # Pattern 2: Any parenthetical that looks like a slug
     for m in _PAREN_TICKER_RE.finditer(text):
         slug = m.group(1).lower()
-        # Filter: must contain at least one hyphen AND look like a polymarket slug
         if '-' in slug and slug not in candidates:
             candidates.append(slug)
-
-    # Pattern 3: "Did you mean:" lines — capture the last parenthetical on each numbered line
     for line in text.splitlines():
         stripped = line.strip()
         if re.match(r'^\d+\.', stripped):
-            # Find the LAST parenthetical on this line
             parens = re.findall(r'\(([^)]+)\)', stripped)
             if parens:
                 last = parens[-1].strip().lower()
                 if '-' in last and len(last) > 5 and last not in candidates:
                     candidates.append(last)
-
-    # Filter out the original failing slug
     if exclude_slug:
         candidates = [c for c in candidates if c != exclude_slug.lower()]
-
-    # Deduplicate while preserving order
     seen = set()
     result = []
     for c in candidates:
         if c not in seen:
             seen.add(c)
             result.append(c)
-
     return result
 
 def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
-    """Executes `bullpen polymarket sell <slug> <outcome> <shares>` with exact market ticker.
-    On exit code 4 (market not found), auto-parses suggested tickers from the combined
-    stdout+stderr and retries immediately."""
     bin_path = get_bullpen_binary_path()
     cmd_parts = [bin_path, "polymarket", "sell", market_slug, outcome, str(shares)]
-
     env = os.environ.copy()
     bullpen_bin_dir = os.path.expanduser("~/.bullpen/bin")
     if os.path.exists(bullpen_bin_dir):
         env["PATH"] = f"{bullpen_bin_dir}:{env.get('PATH', '')}"
-
     try:
         res = subprocess.run(cmd_parts, capture_output=True, text=True, check=True, timeout=15, env=env)
         return res.stdout.strip()
     except subprocess.TimeoutExpired:
         return "[Error] `bullpen polymarket sell` command timed out."
     except subprocess.CalledProcessError as e:
-        # CRITICAL: combine ALL output streams — bullpen splits "Did you mean:"
-        # across stdout and stderr unpredictably.
         combined = (e.stdout or "") + "\n" + (e.stderr or "")
-        # Also try e.output as fallback (some Python versions use this)
         if not combined.strip():
             combined = getattr(e, 'output', '') or ''
-
         print(f"[Sell Debug] combined output ({len(combined)} chars): {combined[:500]}", file=sys.stderr)
-
-        # Extract ALL possible tickers from the combined output
         all_candidates = _extract_all_tickers(combined, exclude_slug=market_slug)
-
         print(f"[Sell Debug] Extracted candidates: {all_candidates}", file=sys.stderr)
-
         if all_candidates:
-            for ticker in all_candidates[:5]:  # try up to 5 candidates
+            for ticker in all_candidates[:5]:
                 print(f"[Sell Instant Retry] Retrying with suggested ticker: {ticker}", file=sys.stderr)
                 retry_parts = [bin_path, "polymarket", "sell", ticker, outcome, str(shares)]
                 try:
@@ -359,30 +308,18 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
                 except Exception as retry_err:
                     combined_retry = (getattr(retry_err, 'stdout', '') or '') + "\n" + (getattr(retry_err, 'stderr', '') or '')
                     print(f"[Sell Retry Failed for {ticker}] {combined_retry[:200]}", file=sys.stderr)
-
         err_out = combined.strip() or f"Exit code {e.returncode}"
         return f"[Sell Error] Exit code {e.returncode}: {_trunc(err_out, 900)}"
     except Exception as e:
         return f"[Sell Error] Failed to sell position: {e}"
 
 # ── SLUG RESOLUTION ─────────────────────────────────────────
-# Golden rule: NEVER text-slugify a sports market title.
-# Sports markets use structured tickers (mlb-kc-det-2026-07-24).
-# A text slug like "athletics-vs-minnesota-twins" will ALWAYS fail on sell.
-# Instead, extract the slug from bullpen's JSON fields or Polymarket's Gamma API.
-
-_slug_cache = {}          # key -> exact slug (or None for negative cache)
-_json_keys_logged = False # debug: log bullpen JSON keys once
-
-# Known slug/ticker keys bullpen might use in its JSON output.
-# We search ALL keys (case-insensitive partial match) rather than guessing.
+_slug_cache = {}
+_json_keys_logged = False
 _SLUG_KEY_PATTERNS = re.compile(r'slug|ticker|event', re.IGNORECASE)
-
-# Sports whose markets MUST use structured tickers.
 _SPORTS_REQUIRING_TICKERS = {"mlb", "nba", "nfl", "nhl"}
 
 def _detect_sport_from_title(title: str) -> str:
-    """Quick sport detection from market title or team names."""
     if not title:
         return "unknown"
     t = title.lower()
@@ -395,38 +332,28 @@ def _detect_sport_from_title(title: str) -> str:
     return "unknown"
 
 def _is_truncated(s: str) -> bool:
-    """Check if a string looks truncated (ends with ... or …)."""
     if not s:
         return True
     return s.rstrip().endswith("...") or s.rstrip().endswith("…")
 
 def _extract_slug_from_bullpen_json(item: dict) -> str:
-    """Search ALL keys in the bullpen JSON position object for a slug/ticker field.
-    Returns the first valid, non-truncated slug found, or None."""
     if not isinstance(item, dict):
         return None
-
-    # Try exact known keys first (most common)
     for key in ["slug", "marketSlug", "eventSlug", "eventTicker", "ticker", "market_slug", "event_slug", "event_ticker"]:
         val = item.get(key)
         if val and isinstance(val, str) and len(val.strip()) > 3 and not _is_truncated(val):
             return val.strip()
-
-    # Search all keys for any that match slug/ticker/event patterns
     for key, val in item.items():
         if not isinstance(val, str) or len(val.strip()) <= 3:
             continue
         if _is_truncated(val):
             continue
         if _SLUG_KEY_PATTERNS.search(key):
-            # Additional check: the value should look like a slug (lowercase, hyphens)
             if re.match(r'^[a-z0-9][a-z0-9\-]{3,}[a-z0-9]$', val.strip()):
                 return val.strip()
-
     return None
 
 def _extract_token_ids_from_bullpen_json(item: dict) -> list[str]:
-    """Extract any token/condition/market IDs from the bullpen JSON for Gamma API lookup."""
     ids = []
     for key in ["conditionId", "condition_id", "conditionID",
                 "tokenId", "token_id", "tokenID",
@@ -437,8 +364,6 @@ def _extract_token_ids_from_bullpen_json(item: dict) -> list[str]:
         val = item.get(key)
         if val:
             ids.append(str(val))
-
-    # Also check nested structures: item.clobTokenIds might be a JSON string or list
     for key in ["clobTokenIds", "clob_token_ids", "tokenIds", "token_ids"]:
         val = item.get(key)
         if isinstance(val, list):
@@ -446,7 +371,6 @@ def _extract_token_ids_from_bullpen_json(item: dict) -> list[str]:
                 if v:
                     ids.append(str(v))
         elif isinstance(val, str):
-            # might be a JSON array string
             try:
                 parsed = json.loads(val)
                 if isinstance(parsed, list):
@@ -456,35 +380,28 @@ def _extract_token_ids_from_bullpen_json(item: dict) -> list[str]:
             except (json.JSONDecodeError, TypeError):
                 if val:
                     ids.append(val)
-
     return ids
 
 def fetch_exact_slug_by_id(token_or_condition_id: str) -> str:
-    """Queries Polymarket Gamma API by token/condition/market ID to get the exact slug."""
     if not token_or_condition_id:
         return None
     if token_or_condition_id in _slug_cache:
         return _slug_cache[token_or_condition_id]
-
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json"
     }
-
-    # Try multiple Gamma API endpoints
     endpoints = [
         f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_or_condition_id}",
         f"https://gamma-api.polymarket.com/markets?condition_id={token_or_condition_id}",
         f"https://gamma-api.polymarket.com/markets/{token_or_condition_id}",
     ]
-
     for url in endpoints:
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode('utf-8'))
-                    # Response can be a list or a single object
                     items = data if isinstance(data, list) else [data]
                     for m in items:
                         if isinstance(m, dict):
@@ -497,60 +414,34 @@ def fetch_exact_slug_by_id(token_or_condition_id: str) -> str:
         except Exception as e:
             print(f"[Gamma API] Endpoint failed ({url}): {e}", file=sys.stderr)
             continue
-
-    # Negative cache: this ID didn't resolve
     _slug_cache[token_or_condition_id] = None
     print(f"[Gamma API] No slug found for ID: {token_or_condition_id}", file=sys.stderr)
     return None
 
 def resolve_exact_slug(market_title: str, item_dict: dict = None) -> str:
-    """Resolves the EXACT Polymarket slug for a position.
-
-    Resolution priority (no text-slugification for sports):
-    1. Direct slug/ticker field in bullpen's JSON item_dict
-    2. On-chain token/condition IDs → Polymarket Gamma API
-    3. For sports markets: return a safe search slug that triggers
-       execute_bullpen_sell's "Did you mean:" auto-retry
-    4. For non-sports markets: text slugification as last resort
-    """
     global _json_keys_logged
     sport = _detect_sport_from_title(market_title)
-
     if item_dict and isinstance(item_dict, dict):
-        # Log all keys once for debugging
         if not _json_keys_logged:
             _json_keys_logged = True
             print(f"[DEBUG] Bullpen JSON keys: {list(item_dict.keys())}", file=sys.stderr)
-
-        # Priority 1: Exact slug from bullpen's own JSON fields
         slug = _extract_slug_from_bullpen_json(item_dict)
         if slug:
             print(f"[Slug] Found in bullpen JSON: {slug}", file=sys.stderr)
             return slug
-
-        # Priority 2: Token/condition IDs → Gamma API
         ids = _extract_token_ids_from_bullpen_json(item_dict)
         for id_val in ids:
             slug = fetch_exact_slug_by_id(id_val)
             if slug:
                 return slug
-
-    # Priority 3: For sports markets, NEVER text-slugify.
-    # Instead, build a clean search query that bullpen will recognize
-    # and execute_bullpen_sell will auto-retry via "Did you mean:".
     if sport in _SPORTS_REQUIRING_TICKERS:
-        # Use the raw title to build a search-friendly slug
-        # This is NOT expected to match on sell — it triggers the retry mechanism
         if market_title:
             clean = market_title.replace("…", "").replace("...", "").strip()
-            # Collapse to simple hyphenated words for bullpen's search
             search_slug = re.sub(r'[^a-z0-9\s]+', '', clean.lower())
             search_slug = re.sub(r'\s+', '-', search_slug.strip())
             print(f"[Slug] Sports market, using search slug (will trigger Did-you-mean retry): {search_slug}", file=sys.stderr)
             return search_slug
         return "sports-market"
-
-    # Priority 4: Non-sports markets (crypto, politics, etc.) — text slugification is usually safe
     if market_title:
         clean = market_title.replace("…", "").replace("...", "").strip()
         s = clean.lower()
@@ -558,68 +449,50 @@ def resolve_exact_slug(market_title: str, item_dict: dict = None) -> str:
         s = re.sub(r'\s+', '-', s.strip())
         s = re.sub(r'-+', '-', s)
         return s.strip('-')
-
     return "unknown-market"
 
 def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
-    """Parses CLI output (JSON or table) into header text and individual position objects."""
     global _json_keys_logged
-
     if not raw_output or raw_output.startswith("[Error]") or raw_output.startswith("[Bullpen Error]"):
         return f"```\n{raw_output}\n```", []
-
     try:
         data = json.loads(raw_output)
         if isinstance(data, list):
             parsed_positions = []
             total_pnl = 0.0
-
             for idx, item in enumerate(data):
                 if not isinstance(item, dict):
                     continue
-
-                # Log first item's keys for debugging
                 if idx == 0 and not _json_keys_logged:
                     _json_keys_logged = True
                     print(f"[DEBUG] Bullpen JSON keys (item 0): {list(item.keys())}", file=sys.stderr)
-                    # Also log the full first item (truncated) to help find slug fields
                     try:
                         item_str = json.dumps(item, default=str)
                         print(f"[DEBUG] Bullpen JSON item 0 (first 500 chars): {item_str[:500]}", file=sys.stderr)
                     except Exception:
                         pass
-
                 title = item.get("title") or item.get("market") or item.get("question") or item.get("name") or "Unknown Market"
                 outcome = item.get("outcome") or item.get("outcomeName") or item.get("side") or "Yes"
-
-                # Resolve exact slug from bullpen JSON fields or Gamma API
                 m_slug = resolve_exact_slug(title, item)
-
                 status = item.get("status", "open")
                 shares = str(item.get("shares") or item.get("size") or item.get("amount") or "0")
-
                 entry_val = item.get("avgPrice") or item.get("entry") or item.get("averagePrice") or 0.0
                 entry = f"${entry_val:.2f}" if isinstance(entry_val, (int, float)) else str(entry_val)
-
                 now_val = item.get("curPrice") or item.get("now") or item.get("currentPrice") or 0.0
                 now = f"${now_val:.2f}" if isinstance(now_val, (int, float)) else str(now_val)
-
                 val_amt = item.get("currentValue") or item.get("value") or item.get("positionValue") or 0.0
                 val = f"${val_amt:.2f}" if isinstance(val_amt, (int, float)) else str(val_amt)
-
                 pnl_num = item.get("pnl") or item.get("profitLoss") or item.get("unrealizedPnl") or 0.0
                 if isinstance(pnl_num, (int, float)):
                     pnl_str = f"-${abs(pnl_num):.2f}" if pnl_num < 0 else f"${pnl_num:.2f}"
                     total_pnl += pnl_num
                 else:
                     pnl_str = str(pnl_num)
-
                 roe_num = item.get("percentPnl") or item.get("roe") or item.get("pnlPercent") or item.get("returnPercent") or 0.0
                 if isinstance(roe_num, (int, float)):
                     roe_str = f"{roe_num:.1f}%"
                 else:
                     roe_str = str(roe_num)
-
                 parsed_positions.append({
                     "raw": json.dumps(item),
                     "market": title,
@@ -633,20 +506,16 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
                     "pnl": pnl_str,
                     "roe": roe_str
                 })
-
             pnl_fmt = f"-${abs(total_pnl):.2f}" if total_pnl < 0 else f"${total_pnl:.2f}"
             header = f"📊 **Positions ({len(parsed_positions)} open, Total P&L: {pnl_fmt})**\n• _Source: polymarket_\n"
             return header, parsed_positions
     except (json.JSONDecodeError, TypeError):
         pass
-
-    # Fallback: parse text table output
     lines = raw_output.splitlines()
     summary_line = ""
     source_line = ""
     table_started = False
     position_lines = []
-
     for line in lines:
         l = line.strip()
         if not l:
@@ -659,13 +528,11 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
             table_started = True
         elif table_started:
             position_lines.append(l)
-
     header = ""
     if summary_line:
         header += f"📊 **{summary_line}**\n"
     if source_line:
         header += f"• _{source_line}_\n"
-
     parsed_positions = []
     if position_lines:
         for pos in position_lines:
@@ -680,10 +547,7 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
                 status = tokens[-7]
                 outcome = tokens[-8]
                 market = " ".join(tokens[:-8])
-                # For table fallback, we have no item_dict — Gamma API lookup won't work
-                # Let execute_bullpen_sell handle it via "Did you mean:" retry
                 slug = resolve_exact_slug(market, None)
-
                 parsed_positions.append({
                     "raw": pos,
                     "market": market,
@@ -710,9 +574,7 @@ def format_card_from_obj(p: dict) -> str:
     )
 
 async def send_positions_embeds(target, title: str, raw_output: str, addr: str = None, src: str = None):
-    """Sends positions as nicely chunked mobile cards across fields/embeds so no trades are cut off."""
     header, pos_objs = parse_positions_to_cards(raw_output)
-
     if not pos_objs:
         embed = discord.Embed(
             title=title,
@@ -723,25 +585,16 @@ async def send_positions_embeds(target, title: str, raw_output: str, addr: str =
         if src: embed.add_field(name="Source", value=src, inline=True)
         await target.send(embed=embed)
         return
-
     cards = [format_card_from_obj(p) for p in pos_objs]
-
     embeds_to_send = []
-    current_embed = discord.Embed(
-        title=title,
-        description=header,
-        color=discord.Color.gold()
-    )
+    current_embed = discord.Embed(title=title, description=header, color=discord.Color.gold())
     if addr: current_embed.add_field(name="Address", value=addr, inline=True)
     if src: current_embed.add_field(name="Source", value=src, inline=True)
-
     current_field_content = ""
     current_field_count = 0
     current_char_count = len(title) + len(header)
-
     for i, card in enumerate(cards, 1):
         card_text = f"{card}\n\n"
-
         if len(current_field_content) + len(card_text) > 1000:
             current_embed.add_field(
                 name=f"Positions ({i - current_field_count} - {i - 1})",
@@ -751,18 +604,12 @@ async def send_positions_embeds(target, title: str, raw_output: str, addr: str =
             current_char_count += len(current_field_content)
             current_field_content = ""
             current_field_count = 0
-
         if len(current_embed.fields) >= 15 or current_char_count > EMBED_TOTAL_MAX:
             embeds_to_send.append(current_embed)
-            current_embed = discord.Embed(
-                title=f"{title} (Cont.)",
-                color=discord.Color.gold()
-            )
+            current_embed = discord.Embed(title=f"{title} (Cont.)", color=discord.Color.gold())
             current_char_count = len(title)
-
         current_field_content += card_text
         current_field_count += 1
-
     if current_field_content:
         total_cards = len(cards)
         start_idx = total_cards - current_field_count + 1
@@ -771,23 +618,17 @@ async def send_positions_embeds(target, title: str, raw_output: str, addr: str =
             value=current_field_content.strip(),
             inline=False
         )
-
     embeds_to_send.append(current_embed)
-
     for emb in embeds_to_send:
         await target.send(embed=emb)
 
 async def fetch_positions_output(addr: str = None, src: str = None) -> str:
-    """Attempts fetching positions in JSON mode first, falling back to text mode if necessary."""
     res = await asyncio.to_thread(run_bullpen_positions, addr, src, True)
     if res.startswith("[Error]") or res.startswith("[Bullpen Error]") or not res:
         res = await asyncio.to_thread(run_bullpen_positions, addr, src, False)
     return res
 
 async def close_position_task(channel, tp: dict):
-    """Executes a single market sell asynchronously in parallel using exact market ticker.
-    The execute_bullpen_sell function has built-in auto-retry: on exit code 4, it parses
-    'Did you mean:' suggestions and retries with the correct structured ticker immediately."""
     market_slug = tp['slug']
     close_embed = discord.Embed(
         title="⚡ AUTO-CLOSING POSITION",
@@ -795,15 +636,9 @@ async def close_position_task(channel, tp: dict):
         color=discord.Color.orange()
     )
     await channel.send(embed=close_embed)
-
     try:
         shares_num = float(tp['shares'])
-        sell_res = await asyncio.to_thread(
-            execute_bullpen_sell,
-            market_slug,
-            tp['outcome'],
-            shares_num
-        )
+        sell_res = await asyncio.to_thread(execute_bullpen_sell, market_slug, tp['outcome'], shares_num)
         is_err = "Error" in sell_res or "[Sell Error]" in sell_res
         res_embed = discord.Embed(
             title="✅ POSITION CLOSED" if not is_err else "❌ AUTO-CLOSE RESULT",
@@ -820,7 +655,6 @@ async def close_position_task(channel, tp: dict):
         await channel.send(embed=err_embed)
 
 async def bullpen_watcher_loop():
-    """Background task continuously monitoring bullpen positions 24/7 across restarts."""
     global last_periodic_time
     while True:
         loop_start = time.time()
@@ -834,15 +668,12 @@ async def bullpen_watcher_loop():
                     sl = bullpen_watch_state.get("stop_loss")
                     auto_close = bullpen_watch_state.get("auto_close_sl", True)
                     periodic_interval = bullpen_watch_state.get("periodic_interval", 300)
-
                     pos_output = await fetch_positions_output(addr, src)
-
                     if pos_output.startswith("[Error]") or pos_output.startswith("[Bullpen Error]"):
                         print(f"[Bullpen Watcher CLI Warning] {pos_output}", file=sys.stderr)
                     else:
                         now = time.time()
                         header, pos_objs = parse_positions_to_cards(pos_output)
-
                         triggered_positions = []
                         if sl is not None:
                             for p in pos_objs:
@@ -854,7 +685,6 @@ async def bullpen_watcher_loop():
                                             triggered_positions.append(p)
                                     except ValueError:
                                         pass
-
                         if triggered_positions:
                             if not bullpen_watch_state.get("sl_alert_fired", False):
                                 embed = discord.Embed(
@@ -869,35 +699,23 @@ async def bullpen_watcher_loop():
                                         inline=False
                                     )
                                 await channel.send(embed=embed)
-
                                 if auto_close:
                                     close_tasks = [close_position_task(channel, tp) for tp in triggered_positions]
                                     await asyncio.gather(*close_tasks)
-
                                 bullpen_watch_state["sl_alert_fired"] = True
                                 save_watcher_config(bullpen_watch_state)
                         else:
                             if bullpen_watch_state.get("sl_alert_fired", False):
                                 bullpen_watch_state["sl_alert_fired"] = False
                                 save_watcher_config(bullpen_watch_state)
-
                         if last_periodic_time == 0 or (now - last_periodic_time) >= periodic_interval:
-                            await send_positions_embeds(
-                                channel,
-                                "📊 Bullpen 5-Min Position Report",
-                                pos_output,
-                                addr,
-                                src
-                            )
+                            await send_positions_embeds(channel, "📊 Bullpen 5-Min Position Report", pos_output, addr, src)
                             last_periodic_time = now
-
                         if pos_output != bullpen_watch_state.get("last_positions"):
                             bullpen_watch_state["last_positions"] = pos_output
                             save_watcher_config(bullpen_watch_state)
-
         except Exception as e:
             print(f"[Bullpen Watcher Loop Error] {e}", file=sys.stderr)
-
         elapsed = time.time() - loop_start
         configured_interval = float(bullpen_watch_state.get("interval", 2))
         sleep_time = max(0.1, configured_interval - elapsed)
@@ -907,7 +725,6 @@ async def bullpen_watcher_loop():
 NO_DRAW_SPORTS = {"mlb", "nba", "nfl", "nhl", "tennis", "mma", "boxing", "f1"}
 
 TEAM_SPORT_MAP = {
-    # MLB
     "diamondbacks": "mlb", "braves": "mlb", "orioles": "mlb", "red sox": "mlb",
     "cubs": "mlb", "white sox": "mlb", "reds": "mlb", "guardians": "mlb",
     "rockies": "mlb", "tigers": "mlb", "astros": "mlb", "royals": "mlb",
@@ -916,7 +733,6 @@ TEAM_SPORT_MAP = {
     "phillies": "mlb", "pirates": "mlb", "padres": "mlb", "giants": "mlb",
     "mariners": "mlb", "cardinals": "mlb", "rays": "mlb", "rangers": "mlb",
     "blue jays": "mlb", "nationals": "mlb",
-    # NBA
     "celtics": "nba", "nets": "nba", "knicks": "nba", "76ers": "nba",
     "raptors": "nba", "bulls": "nba", "cavaliers": "nba", "pistons": "nba",
     "pacers": "nba", "bucks": "nba", "hawks": "nba", "hornets": "nba",
@@ -925,7 +741,6 @@ TEAM_SPORT_MAP = {
     "jazz": "nba", "warriors": "nba", "clippers": "nba", "lakers": "nba",
     "suns": "nba", "kings": "nba", "mavericks": "nba", "rockets": "nba",
     "grizzlies": "nba", "pelicans": "nba", "spurs": "nba",
-    # NFL
     "patriots": "nfl", "dolphins": "nfl", "jets": "nfl", "bills": "nfl",
     "ravens": "nfl", "steelers": "nfl", "browns": "nfl", "bengals": "nfl",
     "texans": "nfl", "colts": "nfl", "jaguars": "nfl", "titans": "nfl",
@@ -934,7 +749,6 @@ TEAM_SPORT_MAP = {
     "packers": "nfl", "lions": "nfl", "vikings": "nfl", "bears": "nfl",
     "buccaneers": "nfl", "saints": "nfl", "panthers": "nfl", "falcons": "nfl",
     "rams": "nfl", "49ers": "nfl", "seahawks": "nfl", "cardinals": "nfl",
-    # NHL
     "bruins": "nhl", "sabres": "nhl", "red wings": "nhl", "panthers": "nhl",
     "canadiens": "nhl", "senators": "nhl", "lightning": "nhl", "maple leafs": "nhl",
     "hurricanes": "nhl", "blue jackets": "nhl", "devils": "nhl", "islanders": "nhl",
@@ -947,32 +761,17 @@ TEAM_SPORT_MAP = {
 }
 
 def detect_sport(match_query: str) -> str:
-    """Detect sport from a text match query. This is a fallback — when Gamma API
-    data is available, use detect_sport_from_gamma_event() instead."""
     query_lower = match_query.lower()
-    # Check for individual sports keywords first
     if "tennis" in query_lower or " atp " in query_lower or " wta " in query_lower:
         return "tennis"
     if "mma" in query_lower or "ufc" in query_lower:
         return "mma"
-    if "boxing" in query_lower or " vs. " in query_lower and any(
-        w in query_lower for w in ("round", "title fight", "heavyweight", "welterweight")
-    ):
+    if "boxing" in query_lower:
         return "boxing"
     if "f1" in query_lower or "grand prix" in query_lower or "formula 1" in query_lower:
         return "f1"
     for sport in NO_DRAW_SPORTS:
         if sport in query_lower:
-            if sport in ("tennis",):
-                return "tennis"
-            if sport in ("baseball",):
-                return "mlb"
-            if sport in ("basketball",):
-                return "nba"
-            if sport in ("football", "american football"):
-                return "nfl"
-            if sport in ("hockey", "ice hockey"):
-                return "nhl"
             return sport
     for team, sport in TEAM_SPORT_MAP.items():
         if team in query_lower:
@@ -989,9 +788,9 @@ SYSTEM_PROMPT = (
     "Never reference betting odds, bookmaker lines, or market prices. "
     "Base probabilities solely on fundamental match data. "
     "BE CONCISE: every string value must be 1 short sentence or phrase — never paragraphs."
+    "DO NOT output reasoning, analysis, or thinking — ONLY the JSON object."
 )
 
-# ── TEAM SPORT PROMPT (MLB, NBA, NFL, NHL, Soccer, etc.) ────
 TEAM_SPORT_USER_PROMPT = (
     'Match: "{match}"\n'
     "Sport: {sport}\n"
@@ -1018,10 +817,10 @@ TEAM_SPORT_USER_PROMPT = (
     "- Every string value must be 1 short sentence or phrase. NEVER write paragraphs.\n"
     "- forecast: 1 sentence max, 15 words max.\n"
     "- form/absences/tactical_edge: 1 phrase each, 8 words max.\n"
-    "- match_name/home_team/away_team: team names only, no extra words."
+    "- match_name/home_team/away_team: team names only, no extra words.\n"
+    "- DO NOT output any reasoning, analysis, or thinking text. ONLY the JSON object."
 )
 
-# ── INDIVIDUAL SPORT PROMPT (Tennis, MMA, Boxing, F1) ───────
 INDIVIDUAL_SPORT_USER_PROMPT = (
     'Match: "{match}"\n'
     "Sport: {sport} (individual sport — no draws, no home/away teams)\n"
@@ -1055,15 +854,10 @@ INDIVIDUAL_SPORT_USER_PROMPT = (
 )
 
 def build_user_prompt(match_query: str, sport: str = None) -> str:
-    """Builds the correct user prompt based on whether the sport is team-based or individual."""
     if sport is None:
         sport = detect_sport(match_query)
-
     if is_individual_sport(sport):
-        return INDIVIDUAL_SPORT_USER_PROMPT.format(
-            match=match_query,
-            sport=sport.upper(),
-        )
+        return INDIVIDUAL_SPORT_USER_PROMPT.format(match=match_query, sport=sport.upper())
     else:
         draws_possible = sport_has_draws(sport)
         if draws_possible:
@@ -1074,10 +868,8 @@ def build_user_prompt(match_query: str, sport: str = None) -> str:
                 "Set draw to 0.0. Only home_win and away_win should sum to 1.0.\n"
             )
         return TEAM_SPORT_USER_PROMPT.format(
-            match=match_query,
-            sport=sport.upper(),
-            draws_possible="yes" if draws_possible else "no",
-            draw_rule=draw_rule,
+            match=match_query, sport=sport.upper(),
+            draws_possible="yes" if draws_possible else "no", draw_rule=draw_rule,
         )
 
 # ── strict llm output schema (validation) ───────────────────
@@ -1099,18 +891,26 @@ def _normalize_double_braces(text: str) -> str:
     return text
 
 def extract_json(raw: str) -> str:
+    """Extract JSON from LLM output. Handles models that output reasoning/thinking
+    prose BEFORE the JSON object by finding the LAST valid JSON block in the text."""
     if not raw:
         raise ValueError("empty response from llm")
     raw = _strip_control_chars(raw)
     raw = raw.strip().lstrip("\ufeff\u200b\u200c\u200d\u2060")
     raw = _normalize_double_braces(raw)
+
+    # Try code block first
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL | re.IGNORECASE)
     if m:
         inner = m.group(1).strip()
         if inner:
             return _strip_trailing_commas(inner)
-    start = raw.find('{')
-    if start != -1:
+
+    # Find ALL JSON objects in the text (there may be reasoning prose before/after)
+    # Take the LAST one — reasoning models put thinking first, JSON last.
+    json_blocks = []
+    for m in re.finditer(r'\{', raw):
+        start = m.start()
         depth = 0
         for i in range(start, len(raw)):
             ch = raw[i]
@@ -1119,11 +919,26 @@ def extract_json(raw: str) -> str:
             elif ch == '}':
                 depth -= 1
                 if depth == 0:
-                    return _strip_trailing_commas(raw[start:i+1])
+                    json_blocks.append(raw[start:i+1])
+                    break
+
+    if json_blocks:
+        # Try each block from LAST to FIRST (reasoning models put JSON last)
+        for block in reversed(json_blocks):
+            candidate = _strip_trailing_commas(block)
+            # Quick validation: must have "match_name" or "true_probabilities" or look like our schema
+            if '"match_name"' in candidate or '"true_probabilities"' in candidate:
+                return candidate
+
+        # Fallback: return the last JSON block even if it doesn't match our schema
+        return _strip_trailing_commas(json_blocks[-1])
+
+    # Last resort: try wrapping bare key:value pairs
     bare = raw.strip().lstrip(',').strip()
     if '"' in bare and ':' in bare:
         wrapped = "{" + bare + "}"
         return _strip_trailing_commas(wrapped)
+
     raise ValueError(f"cannot extract json from: {raw[:500]}")
 
 def _try_json_parse(text: str) -> dict:
@@ -1147,8 +962,6 @@ def validate_llm_output(data: dict, sport: str) -> dict:
     missing_p = PROB_KEYS - set(tp.keys())
     if missing_p:
         raise ValueError(f"missing probability keys: {missing_p}")
-
-    # For individual sports, force draw to 0.0
     if is_individual_sport(sport):
         tp["draw"] = 0.0
         total = tp["home_win"] + tp["away_win"]
@@ -1158,14 +971,12 @@ def validate_llm_output(data: dict, sport: str) -> dict:
         total = tp["home_win"] + tp["draw"] + tp["away_win"]
         if abs(total - 1.0) > 0.015:
             raise ValueError(f"probabilities sum to {total:.4f}, expected 1.0")
-
     if not sport_has_draws(sport):
         tp["draw"] = 0.0
         hw_aw = tp["home_win"] + tp["away_win"]
         if hw_aw > 0:
             tp["home_win"] = tp["home_win"] / hw_aw
             tp["away_win"] = tp["away_win"] / hw_aw
-
     mf = data["matrix_factors"]
     missing_f = FACTOR_KEYS - set(mf.keys())
     if missing_f:
@@ -1196,9 +1007,33 @@ async def fetch_true_probabilities(match_query: str, sport: str = None) -> dict:
         max_tokens=2000,
     )
     msg = response.choices[0].message
+
+    # Some reasoning models put thinking in `content` and the actual response
+    # in a separate field. Check ALL possible fields for JSON content.
     raw = msg.content or ""
-    if not raw and hasattr(msg, "reasoning_content") and msg.reasoning_content:
-        raw = msg.reasoning_content
+
+    # If content looks like reasoning prose (no JSON), check reasoning_content
+    if raw and '{' not in raw[:200]:
+        reasoning = getattr(msg, 'reasoning_content', None) or ''
+        if reasoning and '{' in reasoning:
+            print(f"[LLM] Content is reasoning prose, using reasoning_content instead", file=sys.stderr)
+            raw = reasoning
+
+    # Also check tool_calls or function_call for structured output
+    if not raw or '{' not in raw:
+        tool_calls = getattr(msg, 'tool_calls', None) or []
+        if tool_calls:
+            for tc in tool_calls:
+                func = getattr(tc, 'function', None)
+                if func:
+                    args = getattr(func, 'arguments', None) or ''
+                    if args and '{' in args:
+                        raw = args
+                        break
+
+    if not raw:
+        raise ValueError("empty response from llm")
+
     print(f"\nLLM RAW ({SURPLUS_MODEL}): {repr(raw)[:2000]}\n", file=sys.stderr)
     json_str = extract_json(raw)
     data = _try_json_parse(json_str)
@@ -1245,12 +1080,6 @@ class MatchActionView(discord.ui.View):
 
 @bot.command(name="open", aliases=["positions", "p"])
 async def cmd_open(ctx, *, args: str = ""):
-    """Check Polymarket positions using bullpen CLI immediately.
-    Usage:
-      open / !open / !positions
-      open --address 0x123...
-      open --source bullpen
-    """
     async with ctx.typing():
         addr = None
         src = None
@@ -1262,28 +1091,18 @@ async def cmd_open(ctx, *, args: str = ""):
             m = re.search(r"--source\s+([^\s]+)", args)
             if m:
                 src = m.group(1)
-
         output = await fetch_positions_output(addr, src)
         await send_positions_embeds(ctx, "Bullpen Polymarket Positions", output, addr, src)
 
 @bot.command(name="watchbullpen")
 async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
-    """Start/stop watching bullpen positions 24/7 with optional stop-loss trigger.
-    Usage:
-      !watchbullpen start [--address 0x...] [--source bullpen|polymarket] [--sl 15] [--interval 2] [--channel <id>]
-      watchbullpen start --sl 25
-      !watchbullpen stop
-      !watchbullpen status
-    """
     global bullpen_watch_state
     act = action.lower()
-
     if act == "stop":
         bullpen_watch_state["active"] = False
         save_watcher_config(bullpen_watch_state)
         await ctx.send("🛑 Stopped watching Bullpen positions.")
         return
-
     if act == "status":
         target_ch = bullpen_watch_state.get('channel_id') or MONITOR_CHANNEL_ID
         is_active = "🟢 Active (24/7 Monitoring)" if bullpen_watch_state.get("active") else "🔴 Stopped"
@@ -1302,20 +1121,17 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         )
         await ctx.send(embed=discord.Embed(title="Bullpen Watcher Status", description=status_str, color=discord.Color.blue()))
         return
-
     if act == "start":
         addr = None
         src = None
         sl = None
         interval = 2
         target_ch = MONITOR_CHANNEL_ID
-
         if "--channel" in args:
             m = re.search(r"--channel\s+(\d+)", args)
             if m: target_ch = int(m.group(1))
         elif ctx.channel.id:
             target_ch = ctx.channel.id
-
         if "--address" in args:
             m = re.search(r"--address\s+([^\s]+)", args)
             if m: addr = m.group(1)
@@ -1328,7 +1144,6 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         if "--interval" in args:
             m = re.search(r"--interval\s+(\d+)", args)
             if m: interval = int(m.group(1))
-
         bullpen_watch_state["active"] = True
         bullpen_watch_state["channel_id"] = target_ch
         bullpen_watch_state["address"] = addr
@@ -1337,9 +1152,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         bullpen_watch_state["auto_close_sl"] = True
         bullpen_watch_state["interval"] = max(1, interval)
         bullpen_watch_state["sl_alert_fired"] = False
-
         save_watcher_config(bullpen_watch_state)
-
         sl_desc = f"{sl}%" if sl is not None else "Disabled"
         msg = (
             f"🟢 **Started 24/7 background watching of Bullpen positions!**\n"
@@ -1352,7 +1165,6 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
         )
         await ctx.send(msg)
         return
-
     await ctx.send("Usage: `watchbullpen start|stop|status [--sl <pct>]` or `!watchbullpen start|stop|status`")
 
 @bot.command(name="minedge")
@@ -1370,16 +1182,14 @@ async def cmd_match(ctx, *, args: str):
         gamma_event = None
         detected_sport = None
 
-        # ── detect polymarket url ────────────────────────────
+        # ── detect polymarket url (supports /event/ AND /sports/ paths) ──
         slug_from_url = extract_slug_from_url(match_query)
         if slug_from_url:
             polymarket_slug = slug_from_url
             print(f"[!match] Polymarket URL detected, slug: {polymarket_slug}", file=sys.stderr)
 
-            # Fetch event details from Gamma API
             gamma_event = await asyncio.to_thread(fetch_event_from_gamma, polymarket_slug)
             if gamma_event:
-                # ── extract exact sport from Gamma API ───────
                 detected_sport = detect_sport_from_gamma_event(gamma_event)
                 print(f"[!match] Gamma sport detected: {detected_sport}", file=sys.stderr)
 
@@ -1414,7 +1224,6 @@ async def cmd_match(ctx, *, args: str):
         gid = ctx.guild.id if ctx.guild else ctx.author.id
         min_edge = get_min_edge(gid)
 
-        # ── use Gamma API sport if available, else fallback to text detection ──
         if detected_sport is None:
             detected_sport = detect_sport(match_query)
         has_draws = sport_has_draws(detected_sport)
@@ -1441,7 +1250,6 @@ async def cmd_match(ctx, *, args: str):
         fc  = data.get("forecast", "N/A")
         src = f"Surplus ({SURPLUS_MODEL})"
 
-        # ── display sport label ──────────────────────────────
         sport_display = detected_sport.upper()
         if gamma_event:
             sport_obj = gamma_event.get("sport", {})
@@ -1449,7 +1257,6 @@ async def cmd_match(ctx, *, args: str):
                 series_slug = gamma_event.get("seriesSlug", "")
                 if series_slug:
                     sport_display = series_slug.upper().replace("-", " ")
-            # Also check tags for a nicer label
             tags = gamma_event.get("tags", [])
             if isinstance(tags, list):
                 for tag in tags:
@@ -1459,11 +1266,10 @@ async def cmd_match(ctx, *, args: str):
                                              "serie a", "bundesliga", "ligue 1", "mls",
                                              "champions league", "europa league",
                                              "tennis", "atp", "wta", "mma", "ufc", "boxing",
-                                             "formula 1", "f1"):
+                                             "formula 1", "f1", "allsvenskan"):
                             sport_display = label.upper()
                             break
 
-        # ── use player names for individual sports ───────────
         if individual:
             home_label = data.get('home_team', 'Player 1')
             away_label = data.get('away_team', 'Player 2')
@@ -1476,14 +1282,8 @@ async def cmd_match(ctx, *, args: str):
             color=discord.Color.blue()
         )
 
-        # ── add polymarket slug field if from url ────────────
         if polymarket_slug:
-            embed.add_field(
-                name="Polymarket Slug",
-                value=f"`{polymarket_slug}`",
-                inline=False
-            )
-            # Add market links for each outcome
+            embed.add_field(name="Polymarket Slug", value=f"`{polymarket_slug}`", inline=False)
             if gamma_event:
                 markets = gamma_event.get("markets", [])
                 if markets:
@@ -1500,27 +1300,15 @@ async def cmd_match(ctx, *, args: str):
                         except (json.JSONDecodeError, ValueError):
                             pass
                         market_links.append(f"[{question}{price}](https://polymarket.com/event/{polymarket_slug}#{m_slug})")
-                    embed.add_field(
-                        name="Markets",
-                        value=_trunc("\n".join(market_links), 1000),
-                        inline=False
-                    )
+                    embed.add_field(name="Markets", value=_trunc("\n".join(market_links), 1000), inline=False)
 
-        probs_text = (
-            f"**{home_label}**: {tp['home_win']*100:.1f}%\n"
-        )
+        probs_text = f"**{home_label}**: {tp['home_win']*100:.1f}%\n"
         if has_draws:
             probs_text += f"**Draw**: {tp.get('draw',0)*100:.1f}%\n"
         probs_text += f"**{away_label}**: {tp['away_win']*100:.1f}%"
-
-        embed.add_field(
-            name="True Probabilities (no odds bias)",
-            value=_trunc(probs_text),
-            inline=False
-        )
+        embed.add_field(name="True Probabilities (no odds bias)", value=_trunc(probs_text), inline=False)
         embed.add_field(name="Forecast", value=_trunc(fc), inline=False)
 
-        # ── individual sports: label factors as player-specific ──
         if individual:
             factor_lines = [
                 f"{home_label} form: {mf.get('home_form','?')}",
@@ -1543,16 +1331,11 @@ async def cmd_match(ctx, *, args: str):
             calc = calculate_edges(tp, oh, od, oa)
             edges   = calc["edges"]
             implied = calc["implied"]
-
-            edge_lines = [
-                f"{home_label} implied: {implied['home']*100:.1f}%  |  edge: {edges['home']*100:+.1f}%"
-            ]
+            edge_lines = [f"{home_label} implied: {implied['home']*100:.1f}%  |  edge: {edges['home']*100:+.1f}%"]
             if has_draws and od:
                 edge_lines.append(f"Draw implied: {implied['draw']*100:.1f}%  |  edge: {edges['draw']*100:+.1f}%")
             edge_lines.append(f"{away_label} implied: {implied['away']*100:.1f}%  |  edge: {edges['away']*100:+.1f}%")
-
             embed.add_field(name="Market Edge", value=_trunc("\n".join(edge_lines)), inline=False)
-
             bets = []
             if edges["home"] >= min_edge:
                 bets.append(f"{home_label}: {edges['home']*100:+.1f}%")
@@ -1560,19 +1343,10 @@ async def cmd_match(ctx, *, args: str):
                 bets.append(f"Draw: {edges['draw']*100:+.1f}%")
             if edges["away"] >= min_edge:
                 bets.append(f"{away_label}: {edges['away']*100:+.1f}%")
-
             if bets:
-                embed.add_field(
-                    name=f"VALUE (min edge ≥ {min_edge*100:.1f}%)",
-                    value=_trunc("\n".join(f"✅ {b}" for b in bets)),
-                    inline=False
-                )
+                embed.add_field(name=f"VALUE (min edge ≥ {min_edge*100:.1f}%)", value=_trunc("\n".join(f"✅ {b}" for b in bets)), inline=False)
             else:
-                embed.add_field(
-                    name=f"No value (threshold {min_edge*100:.1f}%)",
-                    value="Pass — no edge exceeds threshold.",
-                    inline=False
-                )
+                embed.add_field(name=f"No value (threshold {min_edge*100:.1f}%)", value="Pass — no edge exceeds threshold.", inline=False)
 
         embed.set_footer(text=f"Engine: {src}  |  min edge: {min_edge*100:.1f}%  |  confidence: {data.get('confidence','?')}")
         view = MatchActionView()
@@ -1586,18 +1360,13 @@ async def on_message(message):
         return
     content_raw = message.content.strip()
     content_lower = content_raw.lower()
-
     if content_lower in ("open", "positions"):
         ctx = await bot.get_context(message)
         await cmd_open(ctx)
         return
-
     if content_lower.startswith("watchbullpen"):
         message.content = "!" + content_raw
-
     await bot.process_commands(message)
-
-# ── global error handler ────────────────────────────────────
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -1612,10 +1381,7 @@ async def on_command_error(ctx, error):
     print(f"[ERROR] {ctx.command}: {error}", file=sys.stderr)
     traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
     try:
-        await ctx.send(
-            f"❌ **Command Failed**: `{type(error).__name__}`\n"
-            f"Details: {error}"
-        )
+        await ctx.send(f"❌ **Command Failed**: `{type(error).__name__}`\nDetails: {error}")
     except Exception:
         pass
 
@@ -1639,8 +1405,6 @@ async def on_disconnect():
 async def on_resumed():
     print("[INFO] discord session resumed", file=sys.stderr)
 
-# ── main with graceful shutdown ─────────────────────────────
-
 async def main():
     token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
@@ -1652,18 +1416,15 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
     def shutdown():
         print("[INFO] shutting down...", file=sys.stderr)
         for task in asyncio.all_tasks(loop):
             task.cancel()
-
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, shutdown)
         except NotImplementedError:
             pass
-
     try:
         loop.run_until_complete(main())
     except KeyboardInterrupt:
