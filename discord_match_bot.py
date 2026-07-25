@@ -177,16 +177,21 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
         # Extract structured sport tickers (mlb-xxx-xxx-YYYY-MM-DD, nba-xxx-xxx-YYYY-MM-DD, etc.)
         suggested_tickers = _TICKER_RE.findall(combined)
 
-        if suggested_tickers:
-            # Deduplicate while preserving order
+        # Also extract any slug from "Did you mean:" lines, e.g.:
+        #   "1. Kansas City Royals vs. Detroit Tigers (mlb-kc-det-2026-07-23)"
+        #   "2. MLB: Who will win... (mlb-who-will-win-chicago-cubs-vs-pittsburgh-pirates-...)"
+        slug_from_did_you_mean = re.findall(r'\(([a-z0-9][a-z0-9\-]{3,}[a-z0-9])\)', combined)
+        all_candidates = suggested_tickers + slug_from_did_you_mean
+
+        if all_candidates:
             seen = set()
-            unique_tickers = []
-            for t in suggested_tickers:
+            unique_candidates = []
+            for t in all_candidates:
                 if t != market_slug and t not in seen:
                     seen.add(t)
-                    unique_tickers.append(t)
+                    unique_candidates.append(t)
 
-            for ticker in unique_tickers:
+            for ticker in unique_candidates:
                 print(f"[Sell Instant Retry] Retrying with suggested ticker: {ticker}", file=sys.stderr)
                 retry_parts = [bin_path, "polymarket", "sell", ticker, outcome, str(shares)]
                 try:
@@ -201,17 +206,20 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
     except Exception as e:
         return f"[Sell Error] Failed to sell position: {e}"
 
-_slug_cache = {}
+# ── SLUG RESOLUTION ─────────────────────────────────────────
+# Golden rule: NEVER text-slugify a sports market title.
+# Sports markets use structured tickers (mlb-kc-det-2026-07-24).
+# A text slug like "athletics-vs-minnesota-twins" will ALWAYS fail on sell.
+# Instead, extract the slug from bullpen's JSON fields or Polymarket's Gamma API.
 
-def to_slug(text: str) -> str:
-    """Converts a market question string into a clean slug, collapsing multiple hyphens."""
-    s = text.lower().replace("…", "").replace("...", "").replace(" ", "-")
-    s = re.sub(r'[^a-z0-9\-]+', '-', s)
-    s = re.sub(r'-+', '-', s)
-    return s.strip('-')
+_slug_cache = {}          # key -> exact slug (or None for negative cache)
+_json_keys_logged = False # debug: log bullpen JSON keys once
 
-# Sports whose markets MUST use structured tickers (mlb-xxx-xxx-YYYY-MM-DD).
-# Never slugify team names for these — the slug will always fail on sell.
+# Known slug/ticker keys bullpen might use in its JSON output.
+# We search ALL keys (case-insensitive partial match) rather than guessing.
+_SLUG_KEY_PATTERNS = re.compile(r'slug|ticker|event', re.IGNORECASE)
+
+# Sports whose markets MUST use structured tickers.
 _SPORTS_REQUIRING_TICKERS = {"mlb", "nba", "nfl", "nhl"}
 
 def _detect_sport_from_title(title: str) -> str:
@@ -227,97 +235,177 @@ def _detect_sport_from_title(title: str) -> str:
             return sport
     return "unknown"
 
+def _is_truncated(s: str) -> bool:
+    """Check if a string looks truncated (ends with ... or …)."""
+    if not s:
+        return True
+    return s.rstrip().endswith("...") or s.rstrip().endswith("…")
+
+def _extract_slug_from_bullpen_json(item: dict) -> str:
+    """Search ALL keys in the bullpen JSON position object for a slug/ticker field.
+    Returns the first valid, non-truncated slug found, or None."""
+    if not isinstance(item, dict):
+        return None
+
+    # Try exact known keys first (most common)
+    for key in ["slug", "marketSlug", "eventSlug", "eventTicker", "ticker", "market_slug", "event_slug", "event_ticker"]:
+        val = item.get(key)
+        if val and isinstance(val, str) and len(val.strip()) > 3 and not _is_truncated(val):
+            return val.strip()
+
+    # Search all keys for any that match slug/ticker/event patterns
+    for key, val in item.items():
+        if not isinstance(val, str) or len(val.strip()) <= 3:
+            continue
+        if _is_truncated(val):
+            continue
+        if _SLUG_KEY_PATTERNS.search(key):
+            # Additional check: the value should look like a slug (lowercase, hyphens)
+            if re.match(r'^[a-z0-9][a-z0-9\-]{3,}[a-z0-9]$', val.strip()):
+                return val.strip()
+
+    return None
+
+def _extract_token_ids_from_bullpen_json(item: dict) -> list[str]:
+    """Extract any token/condition/market IDs from the bullpen JSON for Gamma API lookup."""
+    ids = []
+    for key in ["conditionId", "condition_id", "conditionID",
+                "tokenId", "token_id", "tokenID",
+                "clobTokenId", "clob_token_id",
+                "marketId", "market_id", "marketID",
+                "assetId", "asset_id", "assetID",
+                "id", "_id"]:
+        val = item.get(key)
+        if val:
+            ids.append(str(val))
+
+    # Also check nested structures: item.clobTokenIds might be a JSON string or list
+    for key in ["clobTokenIds", "clob_token_ids", "tokenIds", "token_ids"]:
+        val = item.get(key)
+        if isinstance(val, list):
+            for v in val:
+                if v:
+                    ids.append(str(v))
+        elif isinstance(val, str):
+            # might be a JSON array string
+            try:
+                parsed = json.loads(val)
+                if isinstance(parsed, list):
+                    for v in parsed:
+                        if v:
+                            ids.append(str(v))
+            except (json.JSONDecodeError, TypeError):
+                if val:
+                    ids.append(val)
+
+    return ids
+
 def fetch_exact_slug_by_id(token_or_condition_id: str) -> str:
-    """Queries Polymarket Gamma API by asset/token ID, condition ID, or market ID to get the exact ticker/slug."""
+    """Queries Polymarket Gamma API by token/condition/market ID to get the exact slug."""
     if not token_or_condition_id:
         return None
     if token_or_condition_id in _slug_cache:
         return _slug_cache[token_or_condition_id]
 
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json"
+    }
 
-    # 1. Query /markets?clob_token_ids=
-    try:
-        url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_or_condition_id}"
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=1.5) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode('utf-8'))
-                if isinstance(data, list) and len(data) > 0:
-                    m = data[0]
-                    exact_slug = m.get("marketSlug") or m.get("slug")
-                    if exact_slug:
-                        clean_slug = re.sub(r'-+', '-', exact_slug.strip())
-                        _slug_cache[token_or_condition_id] = clean_slug
-                        return clean_slug
-    except Exception as e:
-        print(f"[Clob Token Lookup Error] {e}", file=sys.stderr)
+    # Try multiple Gamma API endpoints in parallel (fastest wins)
+    endpoints = [
+        f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_or_condition_id}",
+        f"https://gamma-api.polymarket.com/markets?condition_id={token_or_condition_id}",
+        f"https://gamma-api.polymarket.com/markets/{token_or_condition_id}",
+    ]
 
-    # 2. Query /markets?condition_id=
-    try:
-        url = f"https://gamma-api.polymarket.com/markets?condition_id={token_or_condition_id}"
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=1.5) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode('utf-8'))
-                if isinstance(data, list) and len(data) > 0:
-                    m = data[0]
-                    exact_slug = m.get("marketSlug") or m.get("slug")
-                    if exact_slug:
-                        clean_slug = re.sub(r'-+', '-', exact_slug.strip())
-                        _slug_cache[token_or_condition_id] = clean_slug
-                        return clean_slug
-    except Exception as e:
-        print(f"[Condition ID Lookup Error] {e}", file=sys.stderr)
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    # Response can be a list or a single object
+                    items = data if isinstance(data, list) else [data]
+                    for m in items:
+                        if isinstance(m, dict):
+                            slug = m.get("slug") or m.get("marketSlug") or m.get("market_slug")
+                            if slug and isinstance(slug, str) and len(slug.strip()) > 3:
+                                clean_slug = re.sub(r'-+', '-', slug.strip())
+                                _slug_cache[token_or_condition_id] = clean_slug
+                                print(f"[Gamma API] Resolved slug: {clean_slug} from ID: {token_or_condition_id}", file=sys.stderr)
+                                return clean_slug
+        except Exception as e:
+            print(f"[Gamma API] Endpoint failed ({url}): {e}", file=sys.stderr)
+            continue
 
+    # Negative cache: this ID didn't resolve
     _slug_cache[token_or_condition_id] = None
+    print(f"[Gamma API] No slug found for ID: {token_or_condition_id}", file=sys.stderr)
     return None
 
 def resolve_exact_slug(market_title: str, item_dict: dict = None) -> str:
-    """Resolves the exact 100% valid Polymarket ticker/slug for sell execution.
+    """Resolves the EXACT Polymarket slug for a position.
 
-    Priority:
-    1. On-chain ID lookup (asset_id, tokenId, conditionId) via Gamma API → exact ticker
-    2. Structured ticker/slug already present in item_dict
-    3. NON-SPORTS markets only: fall back to text slugification
-    4. Sports markets (MLB/NBA/NFL/NHL): return a placeholder that will trigger
-       the "Did you mean:" auto-retry in execute_bullpen_sell, rather than a
-       guaranteed-invalid text slug.
+    Resolution priority (no text-slugification for sports):
+    1. Direct slug/ticker field in bullpen's JSON item_dict
+    2. On-chain token/condition IDs → Polymarket Gamma API
+    3. For sports markets: return a safe search slug that triggers
+       execute_bullpen_sell's "Did you mean:" auto-retry
+    4. For non-sports markets: text slugification as last resort
     """
+    global _json_keys_logged
     sport = _detect_sport_from_title(market_title)
 
     if item_dict and isinstance(item_dict, dict):
-        # Priority 1: on-chain IDs → Gamma API
-        for id_key in ["asset_id", "assetId", "tokenId", "token_id", "conditionId", "condition_id", "market_id", "marketId"]:
-            val = item_dict.get(id_key)
-            if val:
-                exact = fetch_exact_slug_by_id(str(val))
-                if exact:
-                    return exact
+        # Log all keys once for debugging
+        if not _json_keys_logged:
+            _json_keys_logged = True
+            print(f"[DEBUG] Bullpen JSON keys: {list(item_dict.keys())}", file=sys.stderr)
 
-        # Priority 2: structured ticker already present
-        for slug_key in ["eventTicker", "ticker", "marketSlug", "slug", "eventSlug"]:
-            raw_slug = item_dict.get(slug_key)
-            if raw_slug and isinstance(raw_slug, str) and len(raw_slug.strip()) > 0:
-                if not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug:
-                    return re.sub(r'-+', '-', raw_slug.strip())
+        # Priority 1: Exact slug from bullpen's own JSON fields
+        slug = _extract_slug_from_bullpen_json(item_dict)
+        if slug:
+            print(f"[Slug] Found in bullpen JSON: {slug}", file=sys.stderr)
+            return slug
 
-    # For sports markets that require structured tickers, NEVER text-slugify.
-    # A text slug like "athletics-vs-minnesota-twins" will always fail on sell.
-    # Instead, return a safe search-query slug that execute_bullpen_sell's
-    # retry logic can use to find the real ticker via "Did you mean:".
+        # Priority 2: Token/condition IDs → Gamma API
+        ids = _extract_token_ids_from_bullpen_json(item_dict)
+        for id_val in ids:
+            slug = fetch_exact_slug_by_id(id_val)
+            if slug:
+                return slug
+
+    # Priority 3: For sports markets, NEVER text-slugify.
+    # Instead, build a clean search query that bullpen will recognize
+    # and execute_bullpen_sell will auto-retry via "Did you mean:".
     if sport in _SPORTS_REQUIRING_TICKERS:
-        # Build a search-friendly slug that bullpen may recognize
-        clean_title = market_title.replace("…", "").replace("...", "").strip() if market_title else ""
-        # Keep it short — just team names, no dates or extra junk
-        return to_slug(clean_title) if clean_title else "sports-market"
+        # Use the raw title to build a search-friendly slug
+        # This is NOT expected to match on sell — it triggers the retry mechanism
+        if market_title:
+            clean = market_title.replace("…", "").replace("...", "").strip()
+            # Collapse to simple hyphenated words for bullpen's search
+            search_slug = re.sub(r'[^a-z0-9\s]+', '', clean.lower())
+            search_slug = re.sub(r'\s+', '-', search_slug.strip())
+            print(f"[Slug] Sports market, using search slug (will trigger Did-you-mean retry): {search_slug}", file=sys.stderr)
+            return search_slug
+        return "sports-market"
 
-    # Non-sports markets (crypto, politics, etc.): text slugification is usually fine
-    clean_title = market_title.replace("…", "").replace("...", "").strip() if market_title else ""
-    return to_slug(clean_title) if clean_title else "unknown-market"
+    # Priority 4: Non-sports markets (crypto, politics, etc.) — text slugification is usually safe
+    if market_title:
+        clean = market_title.replace("…", "").replace("...", "").strip()
+        s = clean.lower()
+        s = re.sub(r'[^a-z0-9\s]+', '', s)
+        s = re.sub(r'\s+', '-', s.strip())
+        s = re.sub(r'-+', '-', s)
+        return s.strip('-')
+
+    return "unknown-market"
 
 def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
     """Parses CLI output (JSON or table) into header text and individual position objects."""
+    global _json_keys_logged
+
     if not raw_output or raw_output.startswith("[Error]") or raw_output.startswith("[Bullpen Error]"):
         return f"```\n{raw_output}\n```", []
 
@@ -326,32 +414,48 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
         if isinstance(data, list):
             parsed_positions = []
             total_pnl = 0.0
-            for item in data:
-                title = item.get("title") or item.get("market") or item.get("question") or "Unknown Market"
-                outcome = item.get("outcome") or item.get("outcomeName") or "Yes"
 
+            for idx, item in enumerate(data):
+                if not isinstance(item, dict):
+                    continue
+
+                # Log first item's keys for debugging
+                if idx == 0 and not _json_keys_logged:
+                    _json_keys_logged = True
+                    print(f"[DEBUG] Bullpen JSON keys (item 0): {list(item.keys())}", file=sys.stderr)
+                    # Also log the full first item (truncated) to help find slug fields
+                    try:
+                        item_str = json.dumps(item, default=str)
+                        print(f"[DEBUG] Bullpen JSON item 0 (first 500 chars): {item_str[:500]}", file=sys.stderr)
+                    except Exception:
+                        pass
+
+                title = item.get("title") or item.get("market") or item.get("question") or item.get("name") or "Unknown Market"
+                outcome = item.get("outcome") or item.get("outcomeName") or item.get("side") or "Yes"
+
+                # Resolve exact slug from bullpen JSON fields or Gamma API
                 m_slug = resolve_exact_slug(title, item)
 
                 status = item.get("status", "open")
-                shares = str(item.get("shares") or item.get("size") or "0")
+                shares = str(item.get("shares") or item.get("size") or item.get("amount") or "0")
 
-                entry_val = item.get("avgPrice") or item.get("entry") or 0.0
+                entry_val = item.get("avgPrice") or item.get("entry") or item.get("averagePrice") or 0.0
                 entry = f"${entry_val:.2f}" if isinstance(entry_val, (int, float)) else str(entry_val)
 
-                now_val = item.get("curPrice") or item.get("now") or 0.0
+                now_val = item.get("curPrice") or item.get("now") or item.get("currentPrice") or 0.0
                 now = f"${now_val:.2f}" if isinstance(now_val, (int, float)) else str(now_val)
 
-                val_amt = item.get("currentValue") or item.get("value") or 0.0
+                val_amt = item.get("currentValue") or item.get("value") or item.get("positionValue") or 0.0
                 val = f"${val_amt:.2f}" if isinstance(val_amt, (int, float)) else str(val_amt)
 
-                pnl_num = item.get("pnl", 0.0)
+                pnl_num = item.get("pnl") or item.get("profitLoss") or item.get("unrealizedPnl") or 0.0
                 if isinstance(pnl_num, (int, float)):
                     pnl_str = f"-${abs(pnl_num):.2f}" if pnl_num < 0 else f"${pnl_num:.2f}"
                     total_pnl += pnl_num
                 else:
                     pnl_str = str(pnl_num)
 
-                roe_num = item.get("percentPnl", item.get("roe", 0.0))
+                roe_num = item.get("percentPnl") or item.get("roe") or item.get("pnlPercent") or item.get("returnPercent") or 0.0
                 if isinstance(roe_num, (int, float)):
                     roe_str = f"{roe_num:.1f}%"
                 else:
@@ -377,6 +481,7 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
     except (json.JSONDecodeError, TypeError):
         pass
 
+    # Fallback: parse text table output
     lines = raw_output.splitlines()
     summary_line = ""
     source_line = ""
@@ -416,6 +521,8 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
                 status = tokens[-7]
                 outcome = tokens[-8]
                 market = " ".join(tokens[:-8])
+                # For table fallback, we have no item_dict — Gamma API lookup won't work
+                # Let execute_bullpen_sell handle it via "Did you mean:" retry
                 slug = resolve_exact_slug(market, None)
 
                 parsed_positions.append({
