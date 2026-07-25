@@ -49,18 +49,12 @@ def set_min_edge(guild_id: int, edge: float):
     user_settings[guild_id]["min_edge"] = edge
 
 # ── polymarket url parsing ──────────────────────────────────
-# Matches BOTH URL formats and extracts slug + optional sport category:
-#   https://polymarket.com/event/kor-poh-jeo-2026-07-25
-#   https://polymarket.com/sports/mma/ufc-fight-night-2026-07-25
-#   https://polymarket.com/sports/swe/swe-deg-dju-2026-07-25
 _POLYMARKET_URL_RE = re.compile(
     r'https?://polymarket\.com/(?:event|sports/([a-z0-9]+))/([a-z0-9][a-z0-9\-]+[a-z0-9])',
     re.IGNORECASE
 )
 
 def extract_slug_and_category_from_url(url: str) -> tuple[str, str]:
-    """Extract the event slug and optional sport category from a Polymarket URL.
-    Returns (slug, category) where category may be None for /event/ URLs."""
     m = _POLYMARKET_URL_RE.search(url)
     if m:
         category = m.group(1).lower() if m.group(1) else None
@@ -68,14 +62,11 @@ def extract_slug_and_category_from_url(url: str) -> tuple[str, str]:
         return slug, category
     return None, None
 
-# For backward compatibility
 def extract_slug_from_url(url: str) -> str:
     slug, _ = extract_slug_and_category_from_url(url)
     return slug
 
 def fetch_event_from_gamma(slug: str) -> dict:
-    """Query Polymarket Gamma API for event details by slug.
-    Returns the event dict or None."""
     url = f"https://gamma-api.polymarket.com/events?slug={slug}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -92,9 +83,68 @@ def fetch_event_from_gamma(slug: str) -> dict:
         print(f"[Gamma API] Event lookup failed for slug '{slug}': {e}", file=sys.stderr)
     return None
 
+# ── fighter data enrichment ─────────────────────────────────
+def _search_fighter_data(query: str) -> str:
+    """Search the web for fighter stats/records to enrich LLM context.
+    Uses DuckDuckGo HTML search (no API key needed)."""
+    encoded = urllib.parse.quote(query)
+    url = f"https://html.duckduckgo.com/html/?q={encoded}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            html = resp.read().decode('utf-8', errors='replace')
+            # Extract text snippets from search result divs
+            snippets = []
+            for m in re.finditer(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL):
+                text = re.sub(r'<[^>]+>', ' ', m.group(1)).strip()
+                text = re.sub(r'\s+', ' ', text)
+                if len(text) > 20:
+                    snippets.append(text)
+            if snippets:
+                return " | ".join(snippets[:5])
+    except Exception as e:
+        print(f"[Fighter Search] Failed for '{query}': {e}", file=sys.stderr)
+    return ""
+
+def enrich_fighter_context(match_query: str, sport: str) -> str:
+    """Build enriched context for individual sports by searching for fighter/player data."""
+    if sport not in ("mma", "boxing", "tennis"):
+        return ""
+    
+    # Extract fighter names from query
+    parts = re.split(r'\s+vs\.?\s+', match_query, maxsplit=1)
+    if len(parts) != 2:
+        return ""
+    
+    fighter1 = parts[0].strip()
+    fighter2 = parts[1].strip()
+    
+    context_parts = []
+    
+    # Search for each fighter
+    for fighter in [fighter1, fighter2]:
+        if sport == "mma":
+            query = f"{fighter} UFC record fight stats"
+        elif sport == "boxing":
+            query = f"{fighter} boxer record stats"
+        elif sport == "tennis":
+            query = f"{fighter} tennis ranking recent results"
+        else:
+            query = f"{fighter} {sport} record"
+        
+        data = _search_fighter_data(query)
+        if data:
+            context_parts.append(f"{fighter}: {data}")
+    
+    if context_parts:
+        return "RECENT FIGHTER DATA (use this to inform your analysis):\n" + "\n".join(context_parts)
+    return ""
+
 # ── sport detection from Gamma API event ────────────────────
 _GAMMA_SPORT_MAP = {
-    # sport.sport field
     "mlb": "mlb", "nba": "nba", "nfl": "nfl", "nhl": "nhl",
     "epl": "soccer", "laliga": "soccer", "seriea": "soccer",
     "bundesliga": "soccer", "ligue1": "soccer", "mls": "soccer",
@@ -105,7 +155,6 @@ _GAMMA_SPORT_MAP = {
     "wnba": "wnba", "cricket": "cricket", "tennis": "tennis",
     "mma": "mma", "boxing": "boxing", "f1": "f1",
     "swe": "soccer",
-    # tag labels (lowercase)
     "soccer": "soccer", "baseball": "mlb", "basketball": "nba",
     "football": "nfl", "hockey": "nhl", "k-league": "soccer",
     "premier league": "soccer", "la liga": "soccer",
@@ -113,13 +162,12 @@ _GAMMA_SPORT_MAP = {
     "ligue 1": "soccer", "mls": "soccer",
     "champions league": "soccer", "europa league": "soccer",
     "tennis": "tennis", "cricket": "cricket",
-    "mma": "mma", "ufc": "mma",           # ← UFC aliased to MMA
+    "mma": "mma", "ufc": "mma",
     "boxing": "boxing", "formula 1": "f1",
     "afl": "afl", "ncaa": "ncaa", "wnba": "wnba",
     "allsvenskan": "soccer",
 }
 
-# URL path category → our internal sport (for /sports/<cat>/ URLs)
 _URL_CATEGORY_SPORT_MAP = {
     "mma": "mma", "ufc": "mma",
     "boxing": "boxing",
@@ -137,7 +185,6 @@ _URL_CATEGORY_SPORT_MAP = {
     "wnba": "wnba",
 }
 
-# ── INDIVIDUAL SPORTS ───────────────────────────────────────
 INDIVIDUAL_SPORTS = {"tennis", "mma", "boxing", "f1"}
 
 def sport_has_draws(sport: str) -> bool:
@@ -148,28 +195,22 @@ def is_individual_sport(sport: str) -> bool:
     return sport in INDIVIDUAL_SPORTS
 
 def detect_sport_from_url_category(category: str) -> str:
-    """Detect sport from the /sports/<category>/ URL path segment.
-    This is a high-confidence signal — the URL itself tells us the sport."""
     if not category:
         return None
     cat = category.lower().strip()
     return _URL_CATEGORY_SPORT_MAP.get(cat)
 
 def detect_sport_from_gamma_event(event: dict) -> str:
-    """Extract the sport from a Gamma API event object."""
     if not event or not isinstance(event, dict):
         return "unknown"
-
     sport_obj = event.get("sport")
     if isinstance(sport_obj, dict):
         sport_code = sport_obj.get("sport", "").lower().strip()
         if sport_code and sport_code in _GAMMA_SPORT_MAP:
             return _GAMMA_SPORT_MAP[sport_code]
-
     series_slug = event.get("seriesSlug", "").lower().strip()
     if series_slug and series_slug in _GAMMA_SPORT_MAP:
         return _GAMMA_SPORT_MAP[series_slug]
-
     tags = event.get("tags", [])
     if isinstance(tags, list):
         for tag in tags:
@@ -180,7 +221,6 @@ def detect_sport_from_gamma_event(event: dict) -> str:
                 slug = tag.get("slug", "").lower().strip()
                 if slug and slug in _GAMMA_SPORT_MAP:
                     return _GAMMA_SPORT_MAP[slug]
-
     return "unknown"
 
 # ── bullpen CLI wrapper & watcher state ─────────────────────
@@ -859,9 +899,12 @@ INDIVIDUAL_SPORT_USER_PROMPT = (
     'Match: "{match}"\n'
     "Sport: {sport} (individual sport — no draws, no home/away teams)\n"
     "Draws possible: no (set draw to 0.0)\n"
-    "Analyze using only: recent form (last 6-10 matches), head-to-head record, "
-    "surface/court preference (tennis), injuries, fatigue/rest days, "
+    "{fighter_context}"
+    "Analyze using: the fighter data provided above (if any), recent form (last 6-10 matches), "
+    "head-to-head record, injuries, fatigue/rest days, "
     "tournament stage pressure, playing style matchup.\n"
+    "CRITICAL: If fighter data is provided above, use it as your PRIMARY source. "
+    "Do NOT guess or rely on training data — the provided search results are more current.\n"
     "Return JSON:\n"
     "{{\n"
     '  "match_name": str,\n'
@@ -891,7 +934,15 @@ def build_user_prompt(match_query: str, sport: str = None) -> str:
     if sport is None:
         sport = detect_sport(match_query)
     if is_individual_sport(sport):
-        return INDIVIDUAL_SPORT_USER_PROMPT.format(match=match_query, sport=sport.upper())
+        fighter_context = enrich_fighter_context(match_query, sport)
+        if fighter_context:
+            print(f"[Fighter Enrichment] Found data for {match_query}", file=sys.stderr)
+        else:
+            print(f"[Fighter Enrichment] No data found for {match_query}", file=sys.stderr)
+        return INDIVIDUAL_SPORT_USER_PROMPT.format(
+            match=match_query, sport=sport.upper(),
+            fighter_context=fighter_context
+        )
     else:
         draws_possible = sport_has_draws(sport)
         if draws_possible:
@@ -1202,14 +1253,12 @@ async def cmd_match(ctx, *, args: str):
         gamma_event = None
         detected_sport = None
 
-        # ── detect polymarket url (supports /event/ AND /sports/<cat>/ paths) ──
         slug_from_url, cat_from_url = extract_slug_and_category_from_url(match_query)
         if slug_from_url:
             polymarket_slug = slug_from_url
             url_category = cat_from_url
             print(f"[!match] Polymarket URL detected, slug: {polymarket_slug}, category: {url_category}", file=sys.stderr)
 
-            # ── HIGHEST CONFIDENCE: sport from URL path /sports/<category>/ ──
             if url_category:
                 url_sport = detect_sport_from_url_category(url_category)
                 if url_sport:
@@ -1218,7 +1267,6 @@ async def cmd_match(ctx, *, args: str):
 
             gamma_event = await asyncio.to_thread(fetch_event_from_gamma, polymarket_slug)
             if gamma_event:
-                # Only use Gamma sport if URL category didn't already give us one
                 if detected_sport is None:
                     detected_sport = detect_sport_from_gamma_event(gamma_event)
                     print(f"[!match] Gamma sport detected: {detected_sport}", file=sys.stderr)
@@ -1238,7 +1286,6 @@ async def cmd_match(ctx, *, args: str):
                 await ctx.send(f"❌ Could not find event for slug `{polymarket_slug}` on Polymarket.")
                 return
 
-        # ── parse odds if provided ───────────────────────────
         if "|" in match_query:
             parts = match_query.split("|")
             match_query = parts[0].strip()
@@ -1334,7 +1381,6 @@ async def cmd_match(ctx, *, args: str):
                         market_links.append(f"[{question}{price}](https://polymarket.com/event/{polymarket_slug}#{m_slug})")
                     embed.add_field(name="Markets", value=_trunc("\n".join(market_links), 1000), inline=False)
 
-        # Build probabilities text — NEVER show a Draw line for no-draw sports
         probs_text = f"**{home_label}**: {tp['home_win']*100:.1f}%\n"
         if has_draws:
             probs_text += f"**Draw**: {tp.get('draw',0)*100:.1f}%\n"
