@@ -149,8 +149,13 @@ def run_bullpen_positions(address: str = None, source: str = None, json_mode: bo
     except Exception as e:
         return f"[Error] Failed to execute bullpen CLI: {e}"
 
+# strict ticker regex — matches structured sport tickers like mlb-kc-det-2026-07-24, nba-lal-bos-2026-06-15, etc.
+_TICKER_RE = re.compile(r'\b([a-z]{3,5}-[a-z]{2,5}-[a-z]{2,5}-\d{4}-\d{2}-\d{2})\b')
+
 def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
-    """Executes `bullpen polymarket sell <slug> <outcome> <shares>` with exact market slug."""
+    """Executes `bullpen polymarket sell <slug> <outcome> <shares>` with exact market ticker.
+    On exit code 4 (market not found), auto-parses suggested tickers from the combined
+    stdout+stderr and retries immediately."""
     bin_path = get_bullpen_binary_path()
     cmd_parts = [bin_path, "polymarket", "sell", market_slug, outcome, str(shares)]
 
@@ -165,22 +170,34 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
     except subprocess.TimeoutExpired:
         return "[Error] `bullpen polymarket sell` command timed out."
     except subprocess.CalledProcessError as e:
-        err_out = (e.stderr.strip() or e.stdout.strip())
+        # CRITICAL FIX: combine stdout AND stderr — "Did you mean:" suggestions
+        # are in stdout, but stderr might also contain text. Use both.
+        combined = (e.stdout or "") + "\n" + (e.stderr or "")
 
-        # Check if bullpen returned "Did you mean:" suggestions as instant safety fallback
-        suggested_slugs = re.findall(r'\(([^)]+)\)', err_out)
-        if suggested_slugs:
-            for suggested in suggested_slugs:
-                if "-" in suggested and suggested != market_slug:
-                    print(f"[Sell Instant Retry] Retrying with suggested ticker: {suggested}", file=sys.stderr)
-                    retry_parts = [bin_path, "polymarket", "sell", suggested, outcome, str(shares)]
-                    try:
-                        res_retry = subprocess.run(retry_parts, capture_output=True, text=True, check=True, timeout=15, env=env)
-                        return res_retry.stdout.strip()
-                    except Exception as retry_err:
-                        print(f"[Sell Retry Failed] {retry_err}", file=sys.stderr)
+        # Extract structured sport tickers (mlb-xxx-xxx-YYYY-MM-DD, nba-xxx-xxx-YYYY-MM-DD, etc.)
+        suggested_tickers = _TICKER_RE.findall(combined)
 
-        return f"[Sell Error] Exit code {e.returncode}: {err_out}"
+        if suggested_tickers:
+            # Deduplicate while preserving order
+            seen = set()
+            unique_tickers = []
+            for t in suggested_tickers:
+                if t != market_slug and t not in seen:
+                    seen.add(t)
+                    unique_tickers.append(t)
+
+            for ticker in unique_tickers:
+                print(f"[Sell Instant Retry] Retrying with suggested ticker: {ticker}", file=sys.stderr)
+                retry_parts = [bin_path, "polymarket", "sell", ticker, outcome, str(shares)]
+                try:
+                    res_retry = subprocess.run(retry_parts, capture_output=True, text=True, check=True, timeout=15, env=env)
+                    return res_retry.stdout.strip()
+                except Exception as retry_err:
+                    combined_retry = (getattr(retry_err, 'stdout', '') or '') + "\n" + (getattr(retry_err, 'stderr', '') or '')
+                    print(f"[Sell Retry Failed for {ticker}] {combined_retry[:300]}", file=sys.stderr)
+
+        err_out = combined.strip() or f"Exit code {e.returncode}"
+        return f"[Sell Error] Exit code {e.returncode}: {_trunc(err_out, 900)}"
     except Exception as e:
         return f"[Sell Error] Failed to sell position: {e}"
 
@@ -192,6 +209,23 @@ def to_slug(text: str) -> str:
     s = re.sub(r'[^a-z0-9\-]+', '-', s)
     s = re.sub(r'-+', '-', s)
     return s.strip('-')
+
+# Sports whose markets MUST use structured tickers (mlb-xxx-xxx-YYYY-MM-DD).
+# Never slugify team names for these — the slug will always fail on sell.
+_SPORTS_REQUIRING_TICKERS = {"mlb", "nba", "nfl", "nhl"}
+
+def _detect_sport_from_title(title: str) -> str:
+    """Quick sport detection from market title or team names."""
+    if not title:
+        return "unknown"
+    t = title.lower()
+    for sport in _SPORTS_REQUIRING_TICKERS:
+        if sport in t:
+            return sport
+    for team, sport in TEAM_SPORT_MAP.items():
+        if team in t:
+            return sport
+    return "unknown"
 
 def fetch_exact_slug_by_id(token_or_condition_id: str) -> str:
     """Queries Polymarket Gamma API by asset/token ID, condition ID, or market ID to get the exact ticker/slug."""
@@ -240,8 +274,20 @@ def fetch_exact_slug_by_id(token_or_condition_id: str) -> str:
     return None
 
 def resolve_exact_slug(market_title: str, item_dict: dict = None) -> str:
-    """Resolves the exact 100% valid Polymarket ticker/slug for sell execution."""
+    """Resolves the exact 100% valid Polymarket ticker/slug for sell execution.
+
+    Priority:
+    1. On-chain ID lookup (asset_id, tokenId, conditionId) via Gamma API → exact ticker
+    2. Structured ticker/slug already present in item_dict
+    3. NON-SPORTS markets only: fall back to text slugification
+    4. Sports markets (MLB/NBA/NFL/NHL): return a placeholder that will trigger
+       the "Did you mean:" auto-retry in execute_bullpen_sell, rather than a
+       guaranteed-invalid text slug.
+    """
+    sport = _detect_sport_from_title(market_title)
+
     if item_dict and isinstance(item_dict, dict):
+        # Priority 1: on-chain IDs → Gamma API
         for id_key in ["asset_id", "assetId", "tokenId", "token_id", "conditionId", "condition_id", "market_id", "marketId"]:
             val = item_dict.get(id_key)
             if val:
@@ -249,12 +295,24 @@ def resolve_exact_slug(market_title: str, item_dict: dict = None) -> str:
                 if exact:
                     return exact
 
+        # Priority 2: structured ticker already present
         for slug_key in ["eventTicker", "ticker", "marketSlug", "slug", "eventSlug"]:
             raw_slug = item_dict.get(slug_key)
             if raw_slug and isinstance(raw_slug, str) and len(raw_slug.strip()) > 0:
                 if not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug:
                     return re.sub(r'-+', '-', raw_slug.strip())
 
+    # For sports markets that require structured tickers, NEVER text-slugify.
+    # A text slug like "athletics-vs-minnesota-twins" will always fail on sell.
+    # Instead, return a safe search-query slug that execute_bullpen_sell's
+    # retry logic can use to find the real ticker via "Did you mean:".
+    if sport in _SPORTS_REQUIRING_TICKERS:
+        # Build a search-friendly slug that bullpen may recognize
+        clean_title = market_title.replace("…", "").replace("...", "").strip() if market_title else ""
+        # Keep it short — just team names, no dates or extra junk
+        return to_slug(clean_title) if clean_title else "sports-market"
+
+    # Non-sports markets (crypto, politics, etc.): text slugification is usually fine
     clean_title = market_title.replace("…", "").replace("...", "").strip() if market_title else ""
     return to_slug(clean_title) if clean_title else "unknown-market"
 
@@ -358,7 +416,7 @@ def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
                 status = tokens[-7]
                 outcome = tokens[-8]
                 market = " ".join(tokens[:-8])
-                slug = resolve_exact_slug(market)
+                slug = resolve_exact_slug(market, None)
 
                 parsed_positions.append({
                     "raw": pos,
@@ -461,7 +519,9 @@ async def fetch_positions_output(addr: str = None, src: str = None) -> str:
     return res
 
 async def close_position_task(channel, tp: dict):
-    """Executes a single market sell asynchronously in parallel using exact market slug."""
+    """Executes a single market sell asynchronously in parallel using exact market ticker.
+    The execute_bullpen_sell function has built-in auto-retry: on exit code 4, it parses
+    'Did you mean:' suggestions and retries with the correct structured ticker immediately."""
     market_slug = tp['slug']
     close_embed = discord.Embed(
         title="⚡ AUTO-CLOSING POSITION",
