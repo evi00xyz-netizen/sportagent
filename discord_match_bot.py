@@ -106,6 +106,19 @@ _GAMMA_SPORT_MAP = {
     "afl": "afl", "ncaa": "ncaa", "wnba": "wnba",
 }
 
+# ── INDIVIDUAL SPORTS ───────────────────────────────────────
+# Sports where the prompt should use player1/player2 framing
+# instead of home/away team framing.
+INDIVIDUAL_SPORTS = {"tennis", "mma", "boxing", "f1"}
+
+def sport_has_draws(sport: str) -> bool:
+    """Sports without draws: MLB, NBA, NFL, NHL, and all individual sports."""
+    no_draw = {"mlb", "nba", "nfl", "nhl", "tennis", "mma", "boxing", "f1"}
+    return sport not in no_draw
+
+def is_individual_sport(sport: str) -> bool:
+    return sport in INDIVIDUAL_SPORTS
+
 def detect_sport_from_gamma_event(event: dict) -> str:
     """Extract the sport from a Gamma API event object.
     Uses sport.sport field, seriesSlug, and tags — in that priority order."""
@@ -835,8 +848,7 @@ async def bullpen_watcher_loop():
         await asyncio.sleep(sleep_time)
 
 # ── sport detection (text-based fallback) ───────────────────
-NO_DRAW_SPORTS = {"mlb", "nba", "nfl", "nhl", "baseball", "basketball", "football", "hockey",
-                  "american football", "ice hockey"}
+NO_DRAW_SPORTS = {"mlb", "nba", "nfl", "nhl", "tennis", "mma", "boxing", "f1"}
 
 TEAM_SPORT_MAP = {
     # MLB
@@ -882,8 +894,21 @@ def detect_sport(match_query: str) -> str:
     """Detect sport from a text match query. This is a fallback — when Gamma API
     data is available, use detect_sport_from_gamma_event() instead."""
     query_lower = match_query.lower()
+    # Check for individual sports keywords first
+    if "tennis" in query_lower or " atp " in query_lower or " wta " in query_lower:
+        return "tennis"
+    if "mma" in query_lower or "ufc" in query_lower:
+        return "mma"
+    if "boxing" in query_lower or " vs. " in query_lower and any(
+        w in query_lower for w in ("round", "title fight", "heavyweight", "welterweight")
+    ):
+        return "boxing"
+    if "f1" in query_lower or "grand prix" in query_lower or "formula 1" in query_lower:
+        return "f1"
     for sport in NO_DRAW_SPORTS:
         if sport in query_lower:
+            if sport in ("tennis",):
+                return "tennis"
             if sport in ("baseball",):
                 return "mlb"
             if sport in ("basketball",):
@@ -900,10 +925,8 @@ def detect_sport(match_query: str) -> str:
         return "soccer"
     return "unknown"
 
-def sport_has_draws(sport: str) -> bool:
-    return sport not in ("mlb", "nba", "nfl", "nhl")
+# ── LLM PROMPT TEMPLATES ────────────────────────────────────
 
-# ── strict llm input schema ─────────────────────────────────
 SYSTEM_PROMPT = (
     "You are a sports probability matrix engine. "
     "Output ONLY valid JSON. Do not include markdown, code blocks, or any text outside the JSON. "
@@ -912,7 +935,8 @@ SYSTEM_PROMPT = (
     "BE CONCISE: every string value must be 1 short sentence or phrase — never paragraphs."
 )
 
-USER_PROMPT_TEMPLATE = (
+# ── TEAM SPORT PROMPT (MLB, NBA, NFL, NHL, Soccer, etc.) ────
+TEAM_SPORT_USER_PROMPT = (
     'Match: "{match}"\n'
     "Sport: {sport}\n"
     "Draws possible: {draws_possible}\n"
@@ -941,23 +965,64 @@ USER_PROMPT_TEMPLATE = (
     "- match_name/home_team/away_team: team names only, no extra words."
 )
 
+# ── INDIVIDUAL SPORT PROMPT (Tennis, MMA, Boxing, F1) ───────
+INDIVIDUAL_SPORT_USER_PROMPT = (
+    'Match: "{match}"\n'
+    "Sport: {sport} (individual sport — no draws, no home/away teams)\n"
+    "Draws possible: no (set draw to 0.0)\n"
+    "Analyze using only: recent form (last 6-10 matches), head-to-head record, "
+    "surface/court preference (tennis), injuries, fatigue/rest days, "
+    "tournament stage pressure, playing style matchup.\n"
+    "Return JSON:\n"
+    "{{\n"
+    '  "match_name": str,\n'
+    '  "home_team": str (use first player/competitor name),\n'
+    '  "away_team": str (use second player/competitor name),\n'
+    '  "true_probabilities": {{"home_win": float, "draw": 0.0, "away_win": float}},\n'
+    '  "matrix_factors": {{\n'
+    '    "home_form": str, "away_form": str,\n'
+    '    "home_absences": str, "away_absences": str,\n'
+    '    "tactical_edge": str\n'
+    '  }},\n'
+    '  "forecast": str,\n'
+    '  "confidence": float\n'
+    "}}\n"
+    "IMPORTANT: {sport} does NOT have draws. Set draw to 0.0. home_win+away_win MUST sum to 1.0.\n"
+    "RULES:\n"
+    "- This is an INDIVIDUAL sport — DO NOT think about teams, venues, or home advantage.\n"
+    "- 'home_team' = first player/competitor listed, 'away_team' = second player/competitor.\n"
+    "- Every string value must be 1 short sentence or phrase. NEVER write paragraphs.\n"
+    "- forecast: 1 sentence max, 15 words max.\n"
+    "- form/absences/tactical_edge: 1 phrase each, 8 words max.\n"
+    "- match_name: just the two player/competitor names, no extra words.\n"
+    "- DO NOT output reasoning or analysis text — ONLY the JSON object."
+)
+
 def build_user_prompt(match_query: str, sport: str = None) -> str:
+    """Builds the correct user prompt based on whether the sport is team-based or individual."""
     if sport is None:
         sport = detect_sport(match_query)
-    draws_possible = sport_has_draws(sport)
-    if draws_possible:
-        draw_rule = ""
-    else:
-        draw_rule = (
-            f"IMPORTANT: {sport.upper()} does NOT have draws. "
-            "Set draw to 0.0. Only home_win and away_win should sum to 1.0.\n"
+
+    if is_individual_sport(sport):
+        return INDIVIDUAL_SPORT_USER_PROMPT.format(
+            match=match_query,
+            sport=sport.upper(),
         )
-    return USER_PROMPT_TEMPLATE.format(
-        match=match_query,
-        sport=sport.upper(),
-        draws_possible="yes" if draws_possible else "no",
-        draw_rule=draw_rule
-    )
+    else:
+        draws_possible = sport_has_draws(sport)
+        if draws_possible:
+            draw_rule = ""
+        else:
+            draw_rule = (
+                f"IMPORTANT: {sport.upper()} does NOT have draws. "
+                "Set draw to 0.0. Only home_win and away_win should sum to 1.0.\n"
+            )
+        return TEAM_SPORT_USER_PROMPT.format(
+            match=match_query,
+            sport=sport.upper(),
+            draws_possible="yes" if draws_possible else "no",
+            draw_rule=draw_rule,
+        )
 
 # ── strict llm output schema (validation) ───────────────────
 REQUIRED_KEYS = {
@@ -1026,15 +1091,25 @@ def validate_llm_output(data: dict, sport: str) -> dict:
     missing_p = PROB_KEYS - set(tp.keys())
     if missing_p:
         raise ValueError(f"missing probability keys: {missing_p}")
-    total = tp["home_win"] + tp["draw"] + tp["away_win"]
-    if abs(total - 1.0) > 0.015:
-        raise ValueError(f"probabilities sum to {total:.4f}, expected 1.0")
+
+    # For individual sports, force draw to 0.0
+    if is_individual_sport(sport):
+        tp["draw"] = 0.0
+        total = tp["home_win"] + tp["away_win"]
+        if abs(total - 1.0) > 0.015:
+            raise ValueError(f"probabilities sum to {total:.4f}, expected 1.0 (individual sport, no draw)")
+    else:
+        total = tp["home_win"] + tp["draw"] + tp["away_win"]
+        if abs(total - 1.0) > 0.015:
+            raise ValueError(f"probabilities sum to {total:.4f}, expected 1.0")
+
     if not sport_has_draws(sport):
         tp["draw"] = 0.0
         hw_aw = tp["home_win"] + tp["away_win"]
         if hw_aw > 0:
             tp["home_win"] = tp["home_win"] / hw_aw
             tp["away_win"] = tp["away_win"] / hw_aw
+
     mf = data["matrix_factors"]
     missing_f = FACTOR_KEYS - set(mf.keys())
     if missing_f:
@@ -1287,6 +1362,7 @@ async def cmd_match(ctx, *, args: str):
         if detected_sport is None:
             detected_sport = detect_sport(match_query)
         has_draws = sport_has_draws(detected_sport)
+        individual = is_individual_sport(detected_sport)
 
         try:
             data = await fetch_true_probabilities(match_query, detected_sport)
@@ -1309,7 +1385,7 @@ async def cmd_match(ctx, *, args: str):
         fc  = data.get("forecast", "N/A")
         src = f"Surplus ({SURPLUS_MODEL})"
 
-        # ── display sport label: use Gamma API sport name if available ──
+        # ── display sport label ──────────────────────────────
         sport_display = detected_sport.upper()
         if gamma_event:
             sport_obj = gamma_event.get("sport", {})
@@ -1325,9 +1401,19 @@ async def cmd_match(ctx, *, args: str):
                         label = tag.get("label", "")
                         if label.lower() in ("soccer", "k-league", "premier league", "la liga",
                                              "serie a", "bundesliga", "ligue 1", "mls",
-                                             "champions league", "europa league"):
+                                             "champions league", "europa league",
+                                             "tennis", "atp", "wta", "mma", "ufc", "boxing",
+                                             "formula 1", "f1"):
                             sport_display = label.upper()
                             break
+
+        # ── use player names for individual sports ───────────
+        if individual:
+            home_label = data.get('home_team', 'Player 1')
+            away_label = data.get('away_team', 'Player 2')
+        else:
+            home_label = data.get('home_team', 'Home')
+            away_label = data.get('away_team', 'Away')
 
         embed = discord.Embed(
             title=f"Matrix: {data.get('match_name', match_query)} ({sport_display})",
@@ -1365,11 +1451,11 @@ async def cmd_match(ctx, *, args: str):
                     )
 
         probs_text = (
-            f"**{data.get('home_team','Home')}**: {tp['home_win']*100:.1f}%\n"
+            f"**{home_label}**: {tp['home_win']*100:.1f}%\n"
         )
         if has_draws:
             probs_text += f"**Draw**: {tp.get('draw',0)*100:.1f}%\n"
-        probs_text += f"**{data.get('away_team','Away')}**: {tp['away_win']*100:.1f}%"
+        probs_text += f"**{away_label}**: {tp['away_win']*100:.1f}%"
 
         embed.add_field(
             name="True Probabilities (no odds bias)",
@@ -1378,13 +1464,23 @@ async def cmd_match(ctx, *, args: str):
         )
         embed.add_field(name="Forecast", value=_trunc(fc), inline=False)
 
-        factor_lines = [
-            f"Home form: {mf.get('home_form','?')}",
-            f"Away form: {mf.get('away_form','?')}",
-            f"Home absences: {mf.get('home_absences','none')}",
-            f"Away absences: {mf.get('away_absences','none')}",
-            f"Tactical edge: {mf.get('tactical_edge','none')}"
-        ]
+        # ── individual sports: label factors as player-specific ──
+        if individual:
+            factor_lines = [
+                f"{home_label} form: {mf.get('home_form','?')}",
+                f"{away_label} form: {mf.get('away_form','?')}",
+                f"{home_label} issues: {mf.get('home_absences','none')}",
+                f"{away_label} issues: {mf.get('away_absences','none')}",
+                f"Style edge: {mf.get('tactical_edge','none')}"
+            ]
+        else:
+            factor_lines = [
+                f"Home form: {mf.get('home_form','?')}",
+                f"Away form: {mf.get('away_form','?')}",
+                f"Home absences: {mf.get('home_absences','none')}",
+                f"Away absences: {mf.get('away_absences','none')}",
+                f"Tactical edge: {mf.get('tactical_edge','none')}"
+            ]
         embed.add_field(name="Factors", value=_trunc("\n".join(factor_lines)), inline=False)
 
         if oh and oa:
@@ -1393,21 +1489,21 @@ async def cmd_match(ctx, *, args: str):
             implied = calc["implied"]
 
             edge_lines = [
-                f"Home implied: {implied['home']*100:.1f}%  |  edge: {edges['home']*100:+.1f}%"
+                f"{home_label} implied: {implied['home']*100:.1f}%  |  edge: {edges['home']*100:+.1f}%"
             ]
             if has_draws and od:
                 edge_lines.append(f"Draw implied: {implied['draw']*100:.1f}%  |  edge: {edges['draw']*100:+.1f}%")
-            edge_lines.append(f"Away implied: {implied['away']*100:.1f}%  |  edge: {edges['away']*100:+.1f}%")
+            edge_lines.append(f"{away_label} implied: {implied['away']*100:.1f}%  |  edge: {edges['away']*100:+.1f}%")
 
             embed.add_field(name="Market Edge", value=_trunc("\n".join(edge_lines)), inline=False)
 
             bets = []
             if edges["home"] >= min_edge:
-                bets.append(f"Home ({data.get('home_team')}): {edges['home']*100:+.1f}%")
+                bets.append(f"{home_label}: {edges['home']*100:+.1f}%")
             if has_draws and od and edges.get("draw") and edges["draw"] >= min_edge:
                 bets.append(f"Draw: {edges['draw']*100:+.1f}%")
             if edges["away"] >= min_edge:
-                bets.append(f"Away ({data.get('away_team')}): {edges['away']*100:+.1f}%")
+                bets.append(f"{away_label}: {edges['away']*100:+.1f}%")
 
             if bets:
                 embed.add_field(
