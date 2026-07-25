@@ -49,22 +49,29 @@ def set_min_edge(guild_id: int, edge: float):
     user_settings[guild_id]["min_edge"] = edge
 
 # ── polymarket url parsing ──────────────────────────────────
-# Matches BOTH URL formats:
+# Matches BOTH URL formats and extracts slug + optional sport category:
 #   https://polymarket.com/event/kor-poh-jeo-2026-07-25
+#   https://polymarket.com/sports/mma/ufc-fight-night-2026-07-25
 #   https://polymarket.com/sports/swe/swe-deg-dju-2026-07-25
-#   https://polymarket.com/event/kor-poh-jeo-2026-07-25#Fr9J4hbu
 _POLYMARKET_URL_RE = re.compile(
-    r'https?://polymarket\.com/(?:event|sports/[a-z]+)/([a-z0-9][a-z0-9\-]+[a-z0-9])',
+    r'https?://polymarket\.com/(?:event|sports/([a-z0-9]+))/([a-z0-9][a-z0-9\-]+[a-z0-9])',
     re.IGNORECASE
 )
 
-def extract_slug_from_url(url: str) -> str:
-    """Extract the event slug from a Polymarket URL.
-    Handles both /event/... and /sports/<category>/... formats."""
+def extract_slug_and_category_from_url(url: str) -> tuple[str, str]:
+    """Extract the event slug and optional sport category from a Polymarket URL.
+    Returns (slug, category) where category may be None for /event/ URLs."""
     m = _POLYMARKET_URL_RE.search(url)
     if m:
-        return m.group(1)
-    return None
+        category = m.group(1).lower() if m.group(1) else None
+        slug = m.group(2)
+        return slug, category
+    return None, None
+
+# For backward compatibility
+def extract_slug_from_url(url: str) -> str:
+    slug, _ = extract_slug_and_category_from_url(url)
+    return slug
 
 def fetch_event_from_gamma(slug: str) -> dict:
     """Query Polymarket Gamma API for event details by slug.
@@ -86,7 +93,6 @@ def fetch_event_from_gamma(slug: str) -> dict:
     return None
 
 # ── sport detection from Gamma API event ────────────────────
-# Maps Gamma API sport codes and tag labels to our internal sport names.
 _GAMMA_SPORT_MAP = {
     # sport.sport field
     "mlb": "mlb", "nba": "nba", "nfl": "nfl", "nhl": "nhl",
@@ -98,7 +104,7 @@ _GAMMA_SPORT_MAP = {
     "ncaa": "ncaa", "ncaaf": "ncaa", "ncaab": "ncaa",
     "wnba": "wnba", "cricket": "cricket", "tennis": "tennis",
     "mma": "mma", "boxing": "boxing", "f1": "f1",
-    "swe": "soccer",  # Swedish league
+    "swe": "soccer",
     # tag labels (lowercase)
     "soccer": "soccer", "baseball": "mlb", "basketball": "nba",
     "football": "nfl", "hockey": "nhl", "k-league": "soccer",
@@ -107,8 +113,28 @@ _GAMMA_SPORT_MAP = {
     "ligue 1": "soccer", "mls": "soccer",
     "champions league": "soccer", "europa league": "soccer",
     "tennis": "tennis", "cricket": "cricket",
-    "mma": "mma", "boxing": "boxing", "formula 1": "f1",
+    "mma": "mma", "ufc": "mma",           # ← UFC aliased to MMA
+    "boxing": "boxing", "formula 1": "f1",
     "afl": "afl", "ncaa": "ncaa", "wnba": "wnba",
+    "allsvenskan": "soccer",
+}
+
+# URL path category → our internal sport (for /sports/<cat>/ URLs)
+_URL_CATEGORY_SPORT_MAP = {
+    "mma": "mma", "ufc": "mma",
+    "boxing": "boxing",
+    "tennis": "tennis",
+    "f1": "f1", "formula1": "f1",
+    "mlb": "mlb", "baseball": "mlb",
+    "nba": "nba", "basketball": "nba",
+    "nfl": "nfl", "football": "nfl",
+    "nhl": "nhl", "hockey": "nhl",
+    "soccer": "soccer", "swe": "soccer", "epl": "soccer",
+    "kor": "soccer", "j1": "soccer", "bra": "soccer", "arg": "soccer",
+    "cricket": "cricket",
+    "afl": "afl",
+    "ncaa": "ncaa",
+    "wnba": "wnba",
 }
 
 # ── INDIVIDUAL SPORTS ───────────────────────────────────────
@@ -120,6 +146,14 @@ def sport_has_draws(sport: str) -> bool:
 
 def is_individual_sport(sport: str) -> bool:
     return sport in INDIVIDUAL_SPORTS
+
+def detect_sport_from_url_category(category: str) -> str:
+    """Detect sport from the /sports/<category>/ URL path segment.
+    This is a high-confidence signal — the URL itself tells us the sport."""
+    if not category:
+        return None
+    cat = category.lower().strip()
+    return _URL_CATEGORY_SPORT_MAP.get(cat)
 
 def detect_sport_from_gamma_event(event: dict) -> str:
     """Extract the sport from a Gamma API event object."""
@@ -891,23 +925,18 @@ def _normalize_double_braces(text: str) -> str:
     return text
 
 def extract_json(raw: str) -> str:
-    """Extract JSON from LLM output. Handles models that output reasoning/thinking
-    prose BEFORE the JSON object by finding the LAST valid JSON block in the text."""
     if not raw:
         raise ValueError("empty response from llm")
     raw = _strip_control_chars(raw)
     raw = raw.strip().lstrip("\ufeff\u200b\u200c\u200d\u2060")
     raw = _normalize_double_braces(raw)
 
-    # Try code block first
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL | re.IGNORECASE)
     if m:
         inner = m.group(1).strip()
         if inner:
             return _strip_trailing_commas(inner)
 
-    # Find ALL JSON objects in the text (there may be reasoning prose before/after)
-    # Take the LAST one — reasoning models put thinking first, JSON last.
     json_blocks = []
     for m in re.finditer(r'\{', raw):
         start = m.start()
@@ -923,17 +952,12 @@ def extract_json(raw: str) -> str:
                     break
 
     if json_blocks:
-        # Try each block from LAST to FIRST (reasoning models put JSON last)
         for block in reversed(json_blocks):
             candidate = _strip_trailing_commas(block)
-            # Quick validation: must have "match_name" or "true_probabilities" or look like our schema
             if '"match_name"' in candidate or '"true_probabilities"' in candidate:
                 return candidate
-
-        # Fallback: return the last JSON block even if it doesn't match our schema
         return _strip_trailing_commas(json_blocks[-1])
 
-    # Last resort: try wrapping bare key:value pairs
     bare = raw.strip().lstrip(',').strip()
     if '"' in bare and ':' in bare:
         wrapped = "{" + bare + "}"
@@ -1007,19 +1031,14 @@ async def fetch_true_probabilities(match_query: str, sport: str = None) -> dict:
         max_tokens=2000,
     )
     msg = response.choices[0].message
-
-    # Some reasoning models put thinking in `content` and the actual response
-    # in a separate field. Check ALL possible fields for JSON content.
     raw = msg.content or ""
 
-    # If content looks like reasoning prose (no JSON), check reasoning_content
     if raw and '{' not in raw[:200]:
         reasoning = getattr(msg, 'reasoning_content', None) or ''
         if reasoning and '{' in reasoning:
             print(f"[LLM] Content is reasoning prose, using reasoning_content instead", file=sys.stderr)
             raw = reasoning
 
-    # Also check tool_calls or function_call for structured output
     if not raw or '{' not in raw:
         tool_calls = getattr(msg, 'tool_calls', None) or []
         if tool_calls:
@@ -1179,19 +1198,32 @@ async def cmd_match(ctx, *, args: str):
         match_query = args
         oh = od = oa = None
         polymarket_slug = None
+        url_category = None
         gamma_event = None
         detected_sport = None
 
-        # ── detect polymarket url (supports /event/ AND /sports/ paths) ──
-        slug_from_url = extract_slug_from_url(match_query)
+        # ── detect polymarket url (supports /event/ AND /sports/<cat>/ paths) ──
+        slug_from_url, cat_from_url = extract_slug_and_category_from_url(match_query)
         if slug_from_url:
             polymarket_slug = slug_from_url
-            print(f"[!match] Polymarket URL detected, slug: {polymarket_slug}", file=sys.stderr)
+            url_category = cat_from_url
+            print(f"[!match] Polymarket URL detected, slug: {polymarket_slug}, category: {url_category}", file=sys.stderr)
+
+            # ── HIGHEST CONFIDENCE: sport from URL path /sports/<category>/ ──
+            if url_category:
+                url_sport = detect_sport_from_url_category(url_category)
+                if url_sport:
+                    detected_sport = url_sport
+                    print(f"[!match] Sport from URL category '{url_category}': {detected_sport}", file=sys.stderr)
 
             gamma_event = await asyncio.to_thread(fetch_event_from_gamma, polymarket_slug)
             if gamma_event:
-                detected_sport = detect_sport_from_gamma_event(gamma_event)
-                print(f"[!match] Gamma sport detected: {detected_sport}", file=sys.stderr)
+                # Only use Gamma sport if URL category didn't already give us one
+                if detected_sport is None:
+                    detected_sport = detect_sport_from_gamma_event(gamma_event)
+                    print(f"[!match] Gamma sport detected: {detected_sport}", file=sys.stderr)
+                else:
+                    print(f"[!match] Using URL category sport ({detected_sport}), Gamma sport: {detect_sport_from_gamma_event(gamma_event)}", file=sys.stderr)
 
                 title = gamma_event.get("title", "")
                 teams = gamma_event.get("teams", [])
@@ -1302,6 +1334,7 @@ async def cmd_match(ctx, *, args: str):
                         market_links.append(f"[{question}{price}](https://polymarket.com/event/{polymarket_slug}#{m_slug})")
                     embed.add_field(name="Markets", value=_trunc("\n".join(market_links), 1000), inline=False)
 
+        # Build probabilities text — NEVER show a Draw line for no-draw sports
         probs_text = f"**{home_label}**: {tp['home_win']*100:.1f}%\n"
         if has_draws:
             probs_text += f"**Draw**: {tp.get('draw',0)*100:.1f}%\n"
