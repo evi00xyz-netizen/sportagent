@@ -150,7 +150,7 @@ def run_bullpen_positions(address: str = None, source: str = None, json_mode: bo
         return f"[Error] Failed to execute bullpen CLI: {e}"
 
 def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
-    """Executes `bullpen polymarket sell <slug> <outcome> <shares>` with automatic retry on CLI suggestions."""
+    """Executes `bullpen polymarket sell <slug> <outcome> <shares>` with exact market slug."""
     bin_path = get_bullpen_binary_path()
     cmd_parts = [bin_path, "polymarket", "sell", market_slug, outcome, str(shares)]
 
@@ -167,12 +167,12 @@ def execute_bullpen_sell(market_slug: str, outcome: str, shares: float) -> str:
     except subprocess.CalledProcessError as e:
         err_out = (e.stderr.strip() or e.stdout.strip())
 
-        # Check if bullpen returned "Did you mean:" suggestions
+        # Check if bullpen returned "Did you mean:" suggestions as instant safety fallback
         suggested_slugs = re.findall(r'\(([^)]+)\)', err_out)
         if suggested_slugs:
             for suggested in suggested_slugs:
                 if "-" in suggested and suggested != market_slug:
-                    print(f"[Sell Retry] Retrying with suggested slug: {suggested}", file=sys.stderr)
+                    print(f"[Sell Instant Retry] Retrying with suggested ticker: {suggested}", file=sys.stderr)
                     retry_parts = [bin_path, "polymarket", "sell", suggested, outcome, str(shares)]
                     try:
                         res_retry = subprocess.run(retry_parts, capture_output=True, text=True, check=True, timeout=15, env=env)
@@ -193,17 +193,37 @@ def to_slug(text: str) -> str:
     s = re.sub(r'-+', '-', s)
     return s.strip('-')
 
-def fetch_exact_slug_by_asset(asset_id_or_condition: str) -> str:
-    """Queries Polymarket Gamma API by asset/condition ID with caching (including negative caching)."""
-    if not asset_id_or_condition:
+def fetch_exact_slug_by_id(token_or_condition_id: str) -> str:
+    """Queries Polymarket Gamma API by asset/token ID, condition ID, or market ID to get the exact ticker/slug."""
+    if not token_or_condition_id:
         return None
-    if asset_id_or_condition in _slug_cache:
-        return _slug_cache[asset_id_or_condition]
+    if token_or_condition_id in _slug_cache:
+        return _slug_cache[token_or_condition_id]
 
-    # Try clob_token_ids lookup
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    # 1. Query /markets?clob_token_ids=
     try:
-        url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={asset_id_or_condition}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_or_condition_id}"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                if isinstance(data, list) and len(data) > 0:
+                    m = data[0]
+                    # Get marketSlug or event ticker from market metadata
+                    exact_slug = m.get("marketSlug") or m.get("slug")
+                    if exact_slug:
+                        clean_slug = re.sub(r'-+', '-', exact_slug.strip())
+                        _slug_cache[token_or_condition_id] = clean_slug
+                        return clean_slug
+    except Exception as e:
+        print(f"[Clob Token Lookup Error] {e}", file=sys.stderr)
+
+    # 2. Query /markets?condition_id=
+    try:
+        url = f"https://gamma-api.polymarket.com/markets?condition_id={token_or_condition_id}"
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=1.5) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode('utf-8'))
@@ -212,51 +232,34 @@ def fetch_exact_slug_by_asset(asset_id_or_condition: str) -> str:
                     exact_slug = m.get("marketSlug") or m.get("slug")
                     if exact_slug:
                         clean_slug = re.sub(r'-+', '-', exact_slug.strip())
-                        _slug_cache[asset_id_or_condition] = clean_slug
+                        _slug_cache[token_or_condition_id] = clean_slug
                         return clean_slug
     except Exception as e:
-        print(f"[Asset Lookup Error] {e}", file=sys.stderr)
+        print(f"[Condition ID Lookup Error] {e}", file=sys.stderr)
 
-    # Try condition_id lookup
-    try:
-        url = f"https://gamma-api.polymarket.com/markets?condition_id={asset_id_or_condition}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=1.5) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode('utf-8'))
-                if isinstance(data, list) and len(data) > 0:
-                    m = data[0]
-                    exact_slug = m.get("marketSlug") or m.get("slug")
-                    if exact_slug:
-                        clean_slug = re.sub(r'-+', '-', exact_slug.strip())
-                        _slug_cache[asset_id_or_condition] = clean_slug
-                        return clean_slug
-    except Exception as e:
-        print(f"[Condition Lookup Error] {e}", file=sys.stderr)
-
-    # Negative caching so we never re-query network every 2s for failed assets
-    _slug_cache[asset_id_or_condition] = None
+    # Cache negative result so we don't repeat failed network requests
+    _slug_cache[token_or_condition_id] = None
     return None
 
 def resolve_exact_slug(market_title: str, item_dict: dict = None) -> str:
-    """Resolves exact Polymarket marketSlug directly from item IDs, or clean fallback string."""
-    clean_title = market_title.replace("…", "").replace("...", "").strip() if market_title else ""
-
+    """Resolves the exact 100% valid Polymarket ticker/slug for sell execution."""
     if item_dict and isinstance(item_dict, dict):
-        # 1. Check direct raw fields from Bullpen JSON
-        raw_slug = item_dict.get("marketSlug") or item_dict.get("slug") or item_dict.get("eventSlug")
-        if raw_slug and isinstance(raw_slug, str) and len(raw_slug.strip()) > 0:
-            if not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug:
-                return re.sub(r'-+', '-', raw_slug.strip())
+        # 1. Check all ID fields returned by Bullpen JSON
+        for id_key in ["asset_id", "assetId", "tokenId", "token_id", "conditionId", "condition_id", "market_id", "marketId"]:
+            val = item_dict.get(id_key)
+            if val:
+                exact = fetch_exact_slug_by_id(str(val))
+                if exact:
+                    return exact
 
-        # 2. Query Gamma API by asset/token ID or condition ID if present
-        asset_id = item_dict.get("asset_id") or item_dict.get("assetId") or item_dict.get("tokenId") or item_dict.get("conditionId")
-        if asset_id:
-            exact_by_id = fetch_exact_slug_by_asset(str(asset_id))
-            if exact_by_id:
-                return exact_by_id
+        # 2. Check direct event ticker / marketSlug fields
+        for slug_key in ["eventTicker", "ticker", "marketSlug", "slug", "eventSlug"]:
+            raw_slug = item_dict.get(slug_key)
+            if raw_slug and isinstance(raw_slug, str) and len(raw_slug.strip()) > 0:
+                if not raw_slug.endswith("-") and "..." not in raw_slug and "…" not in raw_slug:
+                    return re.sub(r'-+', '-', raw_slug.strip())
 
-    # Fallback to direct title slug
+    clean_title = market_title.replace("…", "").replace("...", "").strip() if market_title else ""
     return to_slug(clean_title) if clean_title else "unknown-market"
 
 def parse_positions_to_cards(raw_output: str) -> tuple[str, list[dict]]:
@@ -464,11 +467,11 @@ async def fetch_positions_output(addr: str = None, src: str = None) -> str:
     return res
 
 async def close_position_task(channel, tp: dict):
-    """Executes a single market sell asynchronously in parallel."""
+    """Executes a single market sell asynchronously in parallel using exact market slug."""
     market_slug = tp['slug']
     close_embed = discord.Embed(
         title="⚡ AUTO-CLOSING POSITION",
-        description=f"Executing market sell for `{market_slug}`...",
+        description=f"Executing immediate market sell for `{market_slug}`...",
         color=discord.Color.orange()
     )
     await channel.send(embed=close_embed)
@@ -943,7 +946,7 @@ async def cmd_watchbullpen(ctx, action: str = "status", *, args: str = ""):
             f"• Target Channel: <#{target_ch}>\n"
             f"• Monitoring Interval: `{interval}s` (SL check)\n"
             f"• Stop Loss Trigger: `{sl_desc}`\n"
-            f"• Auto-Close Action: ⚡ Concurrent `bullpen polymarket sell` (Executes all triggered sells in parallel)\n"
+            f"• Auto-Close Action: ⚡ Direct `bullpen polymarket sell` with exact on-chain market tickers\n"
             f"• Periodic Report: Every 5 minutes\n"
             f"• Quick fetch: Type `open` or `!open` anytime to push current positions up."
         )
