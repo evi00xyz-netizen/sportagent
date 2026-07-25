@@ -48,6 +48,39 @@ def set_min_edge(guild_id: int, edge: float):
         user_settings[guild_id] = {}
     user_settings[guild_id]["min_edge"] = edge
 
+# ── polymarket url parsing ──────────────────────────────────
+_POLYMARKET_URL_RE = re.compile(
+    r'https?://polymarket\.com/event/([a-z0-9][a-z0-9\-]+[a-z0-9])',
+    re.IGNORECASE
+)
+
+def extract_slug_from_url(url: str) -> str:
+    """Extract the event slug from a Polymarket URL like
+    https://polymarket.com/event/kor-poh-jeo-2026-07-25#Fr9J4hbu"""
+    m = _POLYMARKET_URL_RE.search(url)
+    if m:
+        return m.group(1)
+    return None
+
+def fetch_event_from_gamma(slug: str) -> dict:
+    """Query Polymarket Gamma API for event details by slug.
+    Returns the event dict or None."""
+    url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json"
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                if isinstance(data, list) and len(data) > 0:
+                    return data[0]
+    except Exception as e:
+        print(f"[Gamma API] Event lookup failed for slug '{slug}': {e}", file=sys.stderr)
+    return None
+
 # ── bullpen CLI wrapper & watcher state ─────────────────────
 def load_watcher_config() -> dict:
     defaults = {
@@ -1141,9 +1174,34 @@ async def cmd_match(ctx, *, args: str):
     async with ctx.typing():
         match_query = args
         oh = od = oa = None
+        polymarket_slug = None
+        gamma_event = None
 
-        if "|" in args:
-            parts = args.split("|")
+        # ── detect polymarket url ────────────────────────────
+        slug_from_url = extract_slug_from_url(match_query)
+        if slug_from_url:
+            polymarket_slug = slug_from_url
+            print(f"[!match] Polymarket URL detected, slug: {polymarket_slug}", file=sys.stderr)
+
+            # Fetch event details from Gamma API
+            gamma_event = await asyncio.to_thread(fetch_event_from_gamma, polymarket_slug)
+            if gamma_event:
+                title = gamma_event.get("title", "")
+                teams = gamma_event.get("teams", [])
+                if len(teams) >= 2:
+                    home_team = teams[0].get("name", "")
+                    away_team = teams[1].get("name", "")
+                    match_query = f"{home_team} vs. {away_team}"
+                elif title:
+                    match_query = title.replace(" vs. ", " vs ")
+                print(f"[!match] Gamma event resolved: {match_query} (slug: {polymarket_slug})", file=sys.stderr)
+            else:
+                await ctx.send(f"❌ Could not find event for slug `{polymarket_slug}` on Polymarket.")
+                return
+
+        # ── parse odds if provided ───────────────────────────
+        if "|" in match_query:
+            parts = match_query.split("|")
             match_query = parts[0].strip()
             odds_str = parts[1].replace("odds:", "").strip()
             try:
@@ -1186,6 +1244,36 @@ async def cmd_match(ctx, *, args: str):
             title=f"Matrix: {data.get('match_name', match_query)} ({sport.upper()})",
             color=discord.Color.blue()
         )
+
+        # ── add polymarket slug field if from url ────────────
+        if polymarket_slug:
+            embed.add_field(
+                name="Polymarket Slug",
+                value=f"`{polymarket_slug}`",
+                inline=False
+            )
+            # Add market links for each outcome
+            if gamma_event:
+                markets = gamma_event.get("markets", [])
+                if markets:
+                    market_links = []
+                    for m in markets:
+                        m_slug = m.get("slug", "")
+                        question = m.get("question", "")
+                        price = ""
+                        prices = m.get("outcomePrices", "[]")
+                        try:
+                            price_list = json.loads(prices)
+                            if price_list and len(price_list) > 0:
+                                price = f" — {float(price_list[0])*100:.0f}¢"
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        market_links.append(f"[{question}{price}](https://polymarket.com/event/{polymarket_slug}#{m_slug})")
+                    embed.add_field(
+                        name="Markets",
+                        value=_trunc("\n".join(market_links), 1000),
+                        inline=False
+                    )
 
         probs_text = (
             f"**{data.get('home_team','Home')}**: {tp['home_win']*100:.1f}%\n"
