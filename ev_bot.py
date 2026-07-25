@@ -49,28 +49,17 @@ class MatchProbabilities(BaseModel):
     key_factors: str = Field(...)
     confidence: float = Field(..., ge=0.0, le=1.0)
 
-MATCH_PROB_SCHEMA = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "match_probabilities",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "home_win": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                "draw": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                "away_win": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                "home_team": {"type": "string"},
-                "away_team": {"type": "string"},
-                "match_name": {"type": "string"},
-                "key_factors": {"type": "string"},
-                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-            },
-            "required": ["home_win", "draw", "away_win", "home_team", "away_team", "match_name", "key_factors", "confidence"],
-            "additionalProperties": False,
-        },
-    },
-}
+# JSON Schema as a string for the system prompt (not response_format)
+JSON_SCHEMA_STRING = """{
+  "home_win": <float 0-1>,
+  "draw": <float 0-1>,
+  "away_win": <float 0-1>,
+  "home_team": "<string>",
+  "away_team": "<string>",
+  "match_name": "<string>",
+  "key_factors": "<string>",
+  "confidence": <float 0-1>
+}"""
 
 SYSTEM_PROMPT = (
     "You are a football probability engine. "
@@ -79,8 +68,11 @@ SYSTEM_PROMPT = (
     "injuries, manager quality, home/away form, rest days, and head-to-head history. "
     "You must COMPLETELY IGNORE market consensus, betting volume, current odds, "
     "or any market-derived data. Calculate without market consensus completely. "
-    "Output ONLY valid JSON matching the schema exactly. "
-    "home_win + draw + away_win MUST sum exactly to 1.0."
+    "Output ONLY a valid JSON object matching this schema exactly:\n"
+    f"{JSON_SCHEMA_STRING}\n"
+    "home_win + draw + away_win MUST sum exactly to 1.0. "
+    "Do NOT include any text before or after the JSON. "
+    "Do NOT wrap in markdown code blocks. Output raw JSON only."
 )
 
 USER_PROMPT_TEMPLATE = (
@@ -98,7 +90,7 @@ USER_PROMPT_TEMPLATE = (
     "- Home/away performance splits\n\n"
     "IMPORTANT: Base your analysis ONLY on football fundamentals. "
     "IGNORE all market data, betting odds, and trading volume. "
-    "Output the exact JSON schema with probabilities summing to 1.0."
+    "Output ONLY the raw JSON object — no markdown, no explanation."
 )
 
 # ── Gamma API ───────────────────────────────────────────────
@@ -201,6 +193,23 @@ def get_openai_client() -> AsyncOpenAI:
     return AsyncOpenAI(api_key=SURPLUS_API_KEY, base_url=SURPLUS_BASE_URL)
 
 
+def _extract_json_from_text(text: str) -> dict:
+    """Robust JSON extraction from LLM output — handles markdown, prose, etc."""
+    # Strip markdown code blocks
+    cleaned = text.strip()
+    m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', cleaned, re.DOTALL | re.IGNORECASE)
+    if m:
+        cleaned = m.group(1).strip()
+
+    # Find the outermost JSON object
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        cleaned = cleaned[start:end+1]
+
+    return json.loads(cleaned)
+
+
 async def fetch_fundamental_probabilities(
     match_title: str, home_team: str, away_team: str,
     league: str = "Unknown", match_date: str = "Unknown",
@@ -210,6 +219,8 @@ async def fetch_fundamental_probabilities(
         match_title=match_title, home_team=home_team, away_team=away_team,
         league=league, match_date=match_date,
     )
+
+    # Try json_object mode first (broader API compatibility than json_schema)
     try:
         response = await client.chat.completions.create(
             model=SURPLUS_MODEL,
@@ -217,55 +228,53 @@ async def fetch_fundamental_probabilities(
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.1, max_tokens=1000,
-            response_format=MATCH_PROB_SCHEMA,
+            temperature=0.1,
+            max_tokens=1000,
+            response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content
         if not raw:
             raise ValueError("empty response from LLM")
-        data = json.loads(raw)
-        total = data["home_win"] + data["draw"] + data["away_win"]
-        if abs(total - 1.0) > 0.001:
-            data["home_win"] /= total
-            data["draw"] /= total
-            data["away_win"] /= total
-        return MatchProbabilities(**data)
+
+        print(f"[OpenAI] Raw response ({len(raw)} chars): {raw[:200]}...", file=sys.stderr)
+        data = _extract_json_from_text(raw)
+
     except Exception as e:
-        print(f"[OpenAI] Structured output failed ({e}), falling back", file=sys.stderr)
+        print(f"[OpenAI] json_object mode failed ({e}), trying raw completion", file=sys.stderr)
+        # Fallback: no response_format at all
         response = await client.chat.completions.create(
             model=SURPLUS_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.1, max_tokens=1000,
+            temperature=0.1,
+            max_tokens=1000,
         )
         raw = response.choices[0].message.content or ""
-        return _parse_raw_probabilities(raw)
+        print(f"[OpenAI] Raw fallback response ({len(raw)} chars): {raw[:200]}...", file=sys.stderr)
+        data = _extract_json_from_text(raw)
 
+    # Validate and normalize
+    home = float(data.get("home_win", 0.33))
+    draw = float(data.get("draw", 0.34))
+    away = float(data.get("away_win", 0.33))
+    total = home + draw + away
 
-def _parse_raw_probabilities(raw: str) -> MatchProbabilities:
-    json_str = raw
-    m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL | re.IGNORECASE)
-    if m:
-        json_str = m.group(1).strip()
-    start = json_str.find("{")
-    end = json_str.rfind("}")
-    if start >= 0 and end > start:
-        json_str = json_str[start:end+1]
-    data = json.loads(json_str)
-    total = data.get("home_win", 0) + data.get("draw", 0) + data.get("away_win", 0)
     if total > 0 and abs(total - 1.0) > 0.001:
-        data["home_win"] = data.get("home_win", 0) / total
-        data["draw"] = data.get("draw", 0) / total
-        data["away_win"] = data.get("away_win", 0) / total
+        home /= total
+        draw /= total
+        away /= total
+
     return MatchProbabilities(
-        home_win=data.get("home_win", 0.33), draw=data.get("draw", 0.34),
-        away_win=data.get("away_win", 0.33),
-        home_team=data.get("home_team", "Home"), away_team=data.get("away_team", "Away"),
-        match_name=data.get("match_name", "Unknown"),
-        key_factors=data.get("key_factors", "No factors provided"),
-        confidence=data.get("confidence", 0.5),
+        home_win=home,
+        draw=draw,
+        away_win=away,
+        home_team=str(data.get("home_team", home_team)),
+        away_team=str(data.get("away_team", away_team)),
+        match_name=str(data.get("match_name", match_title)),
+        key_factors=str(data.get("key_factors", "No factors provided")),
+        confidence=float(data.get("confidence", 0.5)),
     )
 
 
