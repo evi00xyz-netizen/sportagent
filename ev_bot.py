@@ -3,7 +3,7 @@ ev_bot.py — EV-Based Polymarket Betting Bot (Kelly Criterion Mode)
 ======================================================================
 Architecture:
   1. Gamma API      → fetch market data + clobTokenIds
-  2. OpenAI (gpt-5.4) → fundamental probabilities (no market data)
+  2. OpenAI (gpt-5.4) → compressed prompt, bivariate Poisson, outputs final probs
   3. CLOB API       → live best-ask prices → decimal odds
   4. EV Math        → deterministic EV = (prob * odds) - 1
   5. Kelly Staking  → f* = EV / (odds - 1), scaled by kelly fraction
@@ -38,7 +38,7 @@ DEFAULT_EV_THRESHOLD = float(os.getenv("EV_THRESHOLD", "0.05"))
 DEFAULT_KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.5"))
 DEFAULT_BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
 
-# ── Pydantic Structured Output Schema ───────────────────────
+# ── Pydantic Output Schema ──────────────────────────────────
 
 class MatchProbabilities(BaseModel):
     home_win: float = Field(..., ge=0.0, le=1.0)
@@ -47,50 +47,32 @@ class MatchProbabilities(BaseModel):
     home_team: str = Field(...)
     away_team: str = Field(...)
     match_name: str = Field(...)
-    key_factors: str = Field(...)
+    justification: str = Field(...)
     confidence: float = Field(..., ge=0.0, le=1.0)
 
-JSON_SCHEMA_STRING = """{
-  "home_win": <float 0-1>,
-  "draw": <float 0-1>,
-  "away_win": <float 0-1>,
-  "home_team": "<string>",
-  "away_team": "<string>",
-  "match_name": "<string>",
-  "key_factors": "<string>",
-  "confidence": <float 0-1>
-}"""
+# ── Compressed Prompts ──────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "You are a football probability engine. "
-    "Calculate fundamental probabilities based ONLY on football team fundamentals: "
-    "Expected Goals (xG), fixture congestion, squad depth, tactical matchups, "
-    "injuries, manager quality, home/away form, rest days, and head-to-head history. "
-    "You must COMPLETELY IGNORE market consensus, betting volume, current odds, "
-    "or any market-derived data. Calculate without market consensus completely. "
-    "Output ONLY a valid JSON object matching this schema exactly:\n"
-    f"{JSON_SCHEMA_STRING}\n"
-    "home_win + draw + away_win MUST sum exactly to 1.0. "
-    "Do NOT include any text before or after the JSON. "
-    "Do NOT wrap in markdown code blocks. Output raw JSON only."
+    "Role: Deterministic Quant Sports Analyst.\n"
+    "Task: Calculate true win/draw/loss probability for football.\n"
+    "Rules:\n"
+    "1. Use purely fundamental data (form, xG, H2H, injuries, venue).\n"
+    "2. IGNORE ALL MARKET ODDS AND CONSENSUS.\n"
+    "3. Run bivariate Poisson distribution internally based on derived expected goals (xG). "
+    "Home venue = +0.20 xG, Away = -0.20 xG.\n"
+    "4. OUTPUT FORMAT STRICT: Output ONLY the final % for Home/Draw/Away, followed by a "
+    "maximum 2-sentence mathematical justification. No conversational filler. No step-by-step math.\n\n"
+    "Output exactly this JSON and nothing else:\n"
+    '{"home_win":0.XX,"draw":0.XX,"away_win":0.XX,"justification":"<2 sentences max>"}\n'
+    "Probabilities MUST sum to 1.0."
 )
 
 USER_PROMPT_TEMPLATE = (
-    'Analyze this football match: "{match_title}"\n'
-    "Home team: {home_team}\n"
-    "Away team: {away_team}\n"
-    "League/Competition: {league}\n"
-    "Match date: {match_date}\n\n"
-    "Consider these fundamental factors:\n"
-    "- Recent form (last 6-10 matches) and xG trends\n"
-    "- Head-to-head record (venue-adjusted)\n"
-    "- Injuries, suspensions, and squad availability\n"
-    "- Fixture congestion and rest days\n"
-    "- Tactical matchup and manager quality\n"
-    "- Home/away performance splits\n\n"
-    "IMPORTANT: Base your analysis ONLY on football fundamentals. "
-    "IGNORE all market data, betting odds, and trading volume. "
-    "Output ONLY the raw JSON object — no markdown, no explanation."
+    "[{league}] | Home: {home_team} | Away: {away_team}\n"
+    "H_Data: {home_data}\n"
+    "A_Data: {away_data}\n"
+    "H2H_Venue: {h2h}\n"
+    "Output probabilities."
 )
 
 # ── Gamma API ───────────────────────────────────────────────
@@ -185,6 +167,59 @@ def share_price_to_decimal_odds(price: float) -> float:
     return 1.0 / price
 
 
+# ── Data Compression ────────────────────────────────────────
+
+def compress_team_data(event: dict, team_idx: int) -> str:
+    """
+    Compress team stats into dense format: [W-D-L], [GF_Avg], [GA_Avg], [Injuries]
+    Falls back to placeholder if Gamma doesn't provide stats.
+    """
+    teams = event.get("teams", [])
+    if team_idx >= len(teams):
+        return "N/A,N/A,N/A,N/A"
+
+    team = teams[team_idx]
+    name = team.get("name", "Unknown")
+
+    # Try to extract from Gamma's nested data
+    # Gamma sometimes provides stats in team metadata
+    stats = team.get("stats", {}) or {}
+
+    wins = stats.get("wins", "?")
+    draws = stats.get("draws", "?")
+    losses = stats.get("losses", "?")
+    gf = stats.get("goalsFor", stats.get("gf", "?"))
+    ga = stats.get("goalsAgainst", stats.get("ga", "?"))
+
+    # Check for injuries in event metadata
+    injuries = event.get("injuries", {}) or {}
+    team_injuries = injuries.get(name, injuries.get(name.lower(), "None"))
+
+    # If no stats at all, use a minimal placeholder — the LLM will still work
+    if wins == "?" and draws == "?" and losses == "?":
+        return f"[?-?-?], [GF:{gf}], [GA:{ga}], [{team_injuries}]"
+
+    return f"[{wins}-{draws}-{losses}], [GF:{gf}], [GA:{ga}], [{team_injuries}]"
+
+
+def compress_h2h(event: dict) -> str:
+    """Compress H2H data from event metadata."""
+    h2h = event.get("headToHead", event.get("h2h", {})) or {}
+    if not h2h:
+        return "No data"
+
+    # Try common Gamma H2H formats
+    last_score = h2h.get("lastScore", h2h.get("last_score", ""))
+    if last_score:
+        return str(last_score)
+
+    last_matches = h2h.get("lastMatches", h2h.get("last_matches", []))
+    if last_matches and len(last_matches) > 0:
+        return str(last_matches[0])
+
+    return "No data"
+
+
 # ── OpenAI Probability Engine ───────────────────────────────
 
 def get_openai_client() -> AsyncOpenAI:
@@ -194,6 +229,7 @@ def get_openai_client() -> AsyncOpenAI:
 
 
 def _extract_json_from_text(text: str) -> dict:
+    """Robust JSON extraction from LLM output."""
     cleaned = text.strip()
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', cleaned, re.DOTALL | re.IGNORECASE)
     if m:
@@ -208,13 +244,36 @@ def _extract_json_from_text(text: str) -> dict:
 async def fetch_fundamental_probabilities(
     match_title: str, home_team: str, away_team: str,
     league: str = "Unknown", match_date: str = "Unknown",
+    event: Optional[dict] = None,
 ) -> MatchProbabilities:
+    """
+    LLM calculates final probabilities directly using bivariate Poisson.
+    Python only handles EV and Kelly — no probability math here.
+    """
     client = get_openai_client()
+
+    # Compress team data
+    if event:
+        home_data = compress_team_data(event, 0)
+        away_data = compress_team_data(event, 1)
+        h2h = compress_h2h(event)
+    else:
+        home_data = "N/A,N/A,N/A,N/A"
+        away_data = "N/A,N/A,N/A,N/A"
+        h2h = "No data"
+
     user_prompt = USER_PROMPT_TEMPLATE.format(
-        match_title=match_title, home_team=home_team, away_team=away_team,
-        league=league, match_date=match_date,
+        league=league,
+        home_team=home_team,
+        away_team=away_team,
+        home_data=home_data,
+        away_data=away_data,
+        h2h=h2h,
     )
 
+    print(f"[OpenAI] Compressed prompt ({len(user_prompt)} chars): {user_prompt}", file=sys.stderr)
+
+    # Try json_object mode first
     try:
         response = await client.chat.completions.create(
             model=SURPLUS_MODEL,
@@ -223,13 +282,13 @@ async def fetch_fundamental_probabilities(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
-            max_tokens=1000,
+            max_tokens=500,
             response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content
         if not raw:
             raise ValueError("empty response from LLM")
-        print(f"[OpenAI] Raw response ({len(raw)} chars): {raw[:200]}...", file=sys.stderr)
+        print(f"[OpenAI] Raw response ({len(raw)} chars): {raw}", file=sys.stderr)
         data = _extract_json_from_text(raw)
     except Exception as e:
         print(f"[OpenAI] json_object mode failed ({e}), trying raw completion", file=sys.stderr)
@@ -240,12 +299,13 @@ async def fetch_fundamental_probabilities(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
-            max_tokens=1000,
+            max_tokens=500,
         )
         raw = response.choices[0].message.content or ""
-        print(f"[OpenAI] Raw fallback response ({len(raw)} chars): {raw[:200]}...", file=sys.stderr)
+        print(f"[OpenAI] Raw fallback response ({len(raw)} chars): {raw}", file=sys.stderr)
         data = _extract_json_from_text(raw)
 
+    # LLM outputs final probabilities — Python just validates
     home = float(data.get("home_win", 0.33))
     draw = float(data.get("draw", 0.34))
     away = float(data.get("away_win", 0.33))
@@ -260,15 +320,15 @@ async def fetch_fundamental_probabilities(
         home_win=home,
         draw=draw,
         away_win=away,
-        home_team=str(data.get("home_team", home_team)),
-        away_team=str(data.get("away_team", away_team)),
-        match_name=str(data.get("match_name", match_title)),
-        key_factors=str(data.get("key_factors", "No factors provided")),
+        home_team=home_team,
+        away_team=away_team,
+        match_name=match_title,
+        justification=str(data.get("justification", "No justification provided")),
         confidence=float(data.get("confidence", 0.5)),
     )
 
 
-# ── EV Calculation ─────────────────────────────────────────
+# ── EV Calculation (Python only — no probability math) ─────
 
 def calculate_ev(probs: MatchProbabilities, clob_prices: dict) -> dict:
     results = {
@@ -289,7 +349,7 @@ def calculate_ev(probs: MatchProbabilities, clob_prices: dict) -> dict:
     return results
 
 
-# ── Kelly Criterion Staking ─────────────────────────────────
+# ── Kelly Criterion Staking (Python only) ───────────────────
 
 def calculate_kelly_bet(
     ev: float,
@@ -300,29 +360,21 @@ def calculate_kelly_bet(
     threshold: float,
 ) -> Optional[dict]:
     """
-    Kelly Criterion: f* = (p * b - q) / b
-    where b = odds - 1 (net odds), p = prob, q = 1 - p
-
-    Simplified: f* = EV / (odds - 1)  [equivalent when EV > 0]
-
-    Then scale by kelly_fraction (e.g. 0.5 = half-Kelly).
+    Kelly Criterion: f* = EV / (odds - 1)
+    Scaled by kelly_fraction, capped at 25% of bankroll.
     """
     if ev < threshold or odds <= 1.0:
         return None
 
-    # Full Kelly fraction of bankroll
-    b = odds - 1.0  # net odds
+    b = odds - 1.0
     if b <= 0:
         return None
 
-    full_kelly_pct = ev / b  # f* = EV / (odds - 1)
+    full_kelly_pct = ev / b
     if full_kelly_pct <= 0:
         return None
 
-    # Apply Kelly fraction multiplier
     scaled_kelly_pct = full_kelly_pct * kelly_fraction
-
-    # Cap at 25% of bankroll per single bet (risk management)
     scaled_kelly_pct = min(scaled_kelly_pct, 0.25)
 
     stake = bankroll * scaled_kelly_pct
@@ -495,12 +547,12 @@ async def cmd_ev(ctx, *, args: str = ""):
 
             print(f"[EV CMD] CLOB prices: home={clob_prices.get('home',{}).get('price')}, draw={clob_prices.get('draw',{}).get('price')}, away={clob_prices.get('away',{}).get('price')}", file=sys.stderr)
 
-            # ── Step 4: AI Probability Engine ──
+            # ── Step 4: AI Probability Engine (LLM does ALL probability math) ──
             print(f"[EV CMD] Calling AI for: {title}", file=sys.stderr)
             try:
                 probs = await fetch_fundamental_probabilities(
                     match_title=title, home_team=home_team, away_team=away_team,
-                    league=league, match_date=str(match_date),
+                    league=league, match_date=str(match_date), event=event,
                 )
             except Exception as e:
                 await ctx.send(f"❌ **AI Engine Error**: {type(e).__name__}: {e}\nCheck SURPLUS_API_KEY and model `{SURPLUS_MODEL}`.")
@@ -508,7 +560,7 @@ async def cmd_ev(ctx, *, args: str = ""):
 
             print(f"[EV CMD] AI probs: home={probs.home_win:.3f}, draw={probs.draw:.3f}, away={probs.away_win:.3f}", file=sys.stderr)
 
-            # ── Step 5: EV Calculation ──
+            # ── Step 5: EV Calculation (Python only) ──
             ev_results = calculate_ev(probs, clob_prices)
             gid = ctx.guild.id if ctx.guild else ctx.author.id
             threshold = get_ev_threshold(gid)
@@ -527,13 +579,16 @@ async def cmd_ev(ctx, *, args: str = ""):
                 color=discord.Color.blue(),
             )
 
-            # Probabilities
+            # Probabilities (LLM output directly)
             prob_lines = [
                 f"🏠 **{probs.home_team}**: {probs.home_win*100:.1f}%",
                 f"🤝 **Draw**: {probs.draw*100:.1f}%",
                 f"🚶 **{probs.away_team}**: {probs.away_win*100:.1f}%",
             ]
-            embed.add_field(name="AI Fundamental Probabilities", value="\n".join(prob_lines), inline=False)
+            embed.add_field(name="AI Fundamental Probabilities (Bivariate Poisson)", value="\n".join(prob_lines), inline=False)
+
+            # Justification
+            embed.add_field(name="📐 Mathematical Justification", value=probs.justification, inline=False)
 
             # CLOB Prices + EV + Kelly Stakes
             ev_lines = []
@@ -581,11 +636,9 @@ async def cmd_ev(ctx, *, args: str = ""):
                     inline=False,
                 )
 
-            # Key factors
-            embed.add_field(name="Key Factors", value=probs.key_factors, inline=False)
             embed.add_field(name="AI Confidence", value=f"{probs.confidence*100:.0f}%", inline=True)
 
-            # Summary footer
+            # Summary
             if positive_ev_outcomes:
                 total_stake = sum(
                     calculate_kelly_bet(
