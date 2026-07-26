@@ -157,107 +157,76 @@ def fetch_event_from_gamma(slug: str) -> Optional[dict]:
     return None
 
 
-def _parse_teams_from_title(title: str) -> tuple:
-    """
-    Parse away/home team names from event title.
-    Polymarket MLB titles: "cleveland guardians vs. tampa bay rays"
-    Returns: (away_name_lower, home_name_lower)
-    """
-    t = title.lower().strip()
-    for sep in [" vs. ", " vs ", " @ "]:
-        if sep in t:
-            parts = t.split(sep, 1)
-            return parts[0].strip(), parts[1].strip()
-    return "", ""
-
-
-def _word_in_text(word: str, text: str) -> bool:
-    """Check if word appears as a case-insensitive substring."""
-    return word.lower() in text.lower() if word and text else False
-
-
-def _is_moneyline_question(question: str) -> bool:
-    """A moneyline question is one that DOESN'T contain spread/O/U/prop keywords."""
-    q = question.lower()
-    skip = ["spread:", "o/u", "over/under", "innings", "extra innings",
-            "1st 5", "strikeout", "home run", "hits", "runs", "total bases"]
-    return not any(s in q for s in skip)
+def _parse_json_array(val) -> list:
+    """Parse a JSON string array or return empty list."""
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return []
 
 
 def extract_mlb_markets_from_event(event: dict) -> list[dict]:
     """
     Extract moneyline markets from an MLB Polymarket event.
 
-    Strategy: parse team names from the title, then for each market question,
-    check which team it exclusively mentions. A moneyline market mentions exactly
-    one team (e.g. "Cleveland Guardians" or "Tampa Bay Rays").
+    Uses Polymarket's own sportsMarketType field to identify the moneyline market.
+    The outcomes array tells us which team is away (index 0) vs home (index 1).
+    clobTokenIds[0] = away token, clobTokenIds[1] = home token.
     """
     markets = event.get("markets", [])
     title = (event.get("title") or "").lower()
 
-    away_name, home_name = _parse_teams_from_title(title)
-
-    # Debug: dump everything
     print(f"[MLB Markets] Title: '{title}'", file=sys.stderr)
-    print(f"[MLB Markets] Parsed: away='{away_name}' home='{home_name}'", file=sys.stderr)
     print(f"[MLB Markets] ===== ALL {len(markets)} MARKETS =====", file=sys.stderr)
     for i, m in enumerate(markets):
         q = m.get("question", "NO_QUESTION")
-        cids = m.get("clobTokenIds", "[]")
-        print(f"[MLB Markets]   [{i}] q='{q}' cids={cids}", file=sys.stderr)
+        mt = m.get("sportsMarketType", "none")
+        print(f"[MLB Markets]   [{i}] type={mt} q='{q[:80]}'", file=sys.stderr)
 
     result = []
-    found_away = None
-    found_home = None
 
     for i, m in enumerate(markets):
-        question_raw = m.get("question", "")
-        question = question_raw.lower().strip()
-        if not question:
+        market_type = m.get("sportsMarketType", "")
+        if market_type != "moneyline":
+            print(f"[MLB Markets]   [{i}] SKIP (type={market_type})", file=sys.stderr)
             continue
 
-        # Get clobTokenIds
-        clob_ids = m.get("clobTokenIds", "[]")
-        if isinstance(clob_ids, str):
-            try:
-                clob_ids = json.loads(clob_ids)
-            except (json.JSONDecodeError, TypeError):
-                clob_ids = []
-        if not clob_ids:
+        clob_ids = _parse_json_array(m.get("clobTokenIds", "[]"))
+        if len(clob_ids) < 2:
+            print(f"[MLB Markets]   [{i}] SKIP (not enough clobTokenIds: {len(clob_ids)})", file=sys.stderr)
             continue
 
-        # Must be moneyline (not spread/O/U/prop)
-        if not _is_moneyline_question(question):
-            print(f"[MLB Markets]   [{i}] SKIP (non-moneyline)", file=sys.stderr)
+        outcomes = _parse_json_array(m.get("outcomes", "[]"))
+        if len(outcomes) < 2:
+            print(f"[MLB Markets]   [{i}] SKIP (not enough outcomes: {len(outcomes)})", file=sys.stderr)
             continue
 
-        token_id = clob_ids[0]
+        away_team = outcomes[0]
+        home_team = outcomes[1]
+        away_token = clob_ids[0]
+        home_token = clob_ids[1]
 
-        # Check: does this question mention away team but NOT home team?
-        mentions_away = away_name and _word_in_text(away_name, question)
-        mentions_home = home_name and _word_in_text(home_name, question)
+        result.append({
+            "type": "away",
+            "token_id": away_token,
+            "question": m.get("question", ""),
+            "team_name": away_team,
+        })
+        result.append({
+            "type": "home",
+            "token_id": home_token,
+            "question": m.get("question", ""),
+            "team_name": home_team,
+        })
 
-        if mentions_away and not mentions_home:
-            if found_away is None:
-                found_away = {"type": "away", "token_id": token_id, "question": question_raw}
-                print(f"[MLB Markets]   [{i}] -> AWAY moneyline", file=sys.stderr)
-            else:
-                print(f"[MLB Markets]   [{i}] -> AWAY (duplicate, skipped)", file=sys.stderr)
-        elif mentions_home and not mentions_away:
-            if found_home is None:
-                found_home = {"type": "home", "token_id": token_id, "question": question_raw}
-                print(f"[MLB Markets]   [{i}] -> HOME moneyline", file=sys.stderr)
-            else:
-                print(f"[MLB Markets]   [{i}] -> HOME (duplicate, skipped)", file=sys.stderr)
-        else:
-            print(f"[MLB Markets]   [{i}] UNMATCHED (away={mentions_away} home={mentions_home})", file=sys.stderr)
+        print(f"[MLB Markets]   [{i}] -> MONEYLINE: away='{away_team}' home='{home_team}'", file=sys.stderr)
+        break  # only one moneyline market per event
 
-    if found_away:
-        result.append(found_away)
-    if found_home:
-        result.append(found_home)
-
-    print(f"[MLB Markets] Total: {len(result)} (away={'yes' if found_away else 'NO'}, home={'yes' if found_home else 'NO'})", file=sys.stderr)
+    print(f"[MLB Markets] Total: {len(result)} (away={'yes' if any(r['type']=='away' for r in result) else 'NO'}, home={'yes' if any(r['type']=='home' for r in result) else 'NO'})", file=sys.stderr)
     return result
 
 
@@ -631,16 +600,8 @@ async def cmd_mlb(ctx, *, args: str = ""):
                 await ctx.send(f"❌ Event not found for slug `{slug}`."); return
 
             title = event.get("title", slug)
-            teams = event.get("teams", [])
-            away_team = teams[0].get("name", "Away") if len(teams) >= 1 else "Away"
-            home_team = teams[1].get("name", "Home") if len(teams) >= 2 else "Home"
 
-            series = event.get("series", [])
-            league = series[0].get("title", "MLB") if isinstance(series, list) and series else "MLB"
-            match_date = event.get("startDate") or event.get("scheduledStart") or "Unknown"
-            away_pitcher, home_pitcher = extract_pitchers_from_event(event)
-            stadium_name = extract_stadium_from_event(event)
-
+            # Get team names from the moneyline market outcomes
             markets = extract_mlb_markets_from_event(event)
 
             if len(markets) < 2:
@@ -662,6 +623,15 @@ async def cmd_mlb(ctx, *, args: str = ""):
                     f"Home: {'yes' if 'home' in market_lookup else 'NO'}."
                 )
                 return
+
+            away_team = market_lookup["away"].get("team_name", "Away")
+            home_team = market_lookup["home"].get("team_name", "Home")
+
+            series = event.get("series", [])
+            league = series[0].get("title", "MLB") if isinstance(series, list) and series else "MLB"
+            match_date = event.get("startDate") or event.get("scheduledStart") or "Unknown"
+            away_pitcher, home_pitcher = extract_pitchers_from_event(event)
+            stadium_name = extract_stadium_from_event(event)
 
             clob_prices = {}
             for outcome_type in ["away", "home"]:
