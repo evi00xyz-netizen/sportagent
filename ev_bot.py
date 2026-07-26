@@ -53,16 +53,14 @@ class MatchProbabilities(BaseModel):
 # ── Prompts ─────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "Role: Deterministic Quant Sports Analyst.\n"
-    "Task: Calculate true win/draw/loss probability for football.\n"
-    "Rules:\n"
-    "1. Use purely fundamental data (form, xG, H2H, injuries, venue).\n"
-    "2. IGNORE ALL MARKET ODDS AND CONSENSUS.\n"
-    "3. Run bivariate Poisson distribution internally based on derived expected goals (xG). "
-    "Home venue = +0.20 xG, Away = -0.20 xG.\n"
-    "4. OUTPUT FORMAT STRICT: Output ONLY the final % for Home/Draw/Away, "
-    "followed by a maximum 2-sentence mathematical justification. "
-    "No conversational filler. No step-by-step math.\n\n"
+    "You are a football probability engine. "
+    "Calculate fundamental probabilities based ONLY on football team fundamentals: "
+    "Expected Goals (xG), fixture congestion, squad depth, tactical matchups, "
+    "injuries, manager quality, home/away form, rest days, and head-to-head history. "
+    "You must COMPLETELY IGNORE market consensus, betting volume, current odds, "
+    "or any market-derived data. Calculate without market consensus completely.\n\n"
+    "Run a bivariate Poisson distribution internally based on derived expected goals (xG). "
+    "Home venue = +0.20 xG, Away = -0.20 xG.\n\n"
     "Output ONLY a valid JSON object with these fields:\n"
     "{\n"
     '  "home_win": <float 0-1>,\n'
@@ -75,22 +73,23 @@ SYSTEM_PROMPT = (
     "Do NOT wrap in markdown code blocks. Output raw JSON only."
 )
 
-
-def build_compressed_prompt(home_team: str, away_team: str, league: str,
-                            h_data: str = "Unknown", a_data: str = "Unknown",
-                            h2h: str = "Unknown") -> str:
-    """
-    Build a dense, compressed user prompt (~300 tokens instead of ~3000).
-    Format: [League] | Home: [A] | Away: [B]  H_Data / A_Data / H2H_Venue
-    """
-    return (
-        f"[{league}] | Home: {home_team} | Away: {away_team}\n"
-        f"H_Data: {h_data}\n"
-        f"A_Data: {a_data}\n"
-        f"H2H_Venue: {h2h}\n"
-        f"Output probabilities."
-    )
-
+USER_PROMPT_TEMPLATE = (
+    'Analyze this football match: "{match_title}"\n'
+    "Home team: {home_team}\n"
+    "Away team: {away_team}\n"
+    "League/Competition: {league}\n"
+    "Match date: {match_date}\n\n"
+    "Consider these fundamental factors:\n"
+    "- Recent form (last 6-10 matches) and xG trends\n"
+    "- Head-to-head record (venue-adjusted)\n"
+    "- Injuries, suspensions, and squad availability\n"
+    "- Fixture congestion and rest days\n"
+    "- Tactical matchup and manager quality\n"
+    "- Home/away performance splits\n\n"
+    "IMPORTANT: Base your analysis ONLY on football fundamentals. "
+    "IGNORE all market data, betting odds, and trading volume. "
+    "Output ONLY the raw JSON object — no markdown, no explanation."
+)
 
 # ── Gamma API ───────────────────────────────────────────────
 
@@ -261,15 +260,15 @@ async def fetch_fundamental_probabilities(
     """
     LLM calculates final probabilities directly using bivariate Poisson.
     Python only handles EV and Kelly — no probability math here.
-    Uses compressed prompt format (~300 tokens) for cost efficiency.
     """
     client = get_openai_client()
 
-    # Build compressed user prompt
-    user_prompt = build_compressed_prompt(
+    user_prompt = USER_PROMPT_TEMPLATE.format(
+        match_title=match_title,
         home_team=home_team,
         away_team=away_team,
         league=league,
+        match_date=match_date,
     )
 
     print(f"[OpenAI] Prompt ({len(user_prompt)} chars)", file=sys.stderr)
