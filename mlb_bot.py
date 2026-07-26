@@ -14,16 +14,7 @@ ALL final probability calculations, risk management, and execution
 decisions are handled exclusively by Python machine code.
 """
 
-import os
-import re
-import json
-import sys
-import asyncio
-import signal
-import traceback
-import urllib.request
-import urllib.parse
-import math
+import os, re, json, sys, asyncio, signal, traceback, urllib.request, urllib.parse, math
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -41,7 +32,7 @@ DEFAULT_EV_THRESHOLD = float(os.getenv("EV_THRESHOLD", "0.05"))
 DEFAULT_KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.5"))
 DEFAULT_BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
 
-# ── Pydantic Output Schema (Sabermetric — no probabilities) ─
+# ── Pydantic Output Schema ──────────────────────────────────
 
 class PitcherData(BaseModel):
     name: str = Field(default="Unknown")
@@ -111,34 +102,13 @@ SYSTEM_PROMPT = (
     '  "away_team": "<string>",\n'
     '  "home_team": "<string>",\n'
     '  "match_name": "<string>",\n'
-    '  "away_pitcher": {\n'
-    '    "name": "<string>", "xfip": <float>, "siera": <float>,\n'
-    '    "k_bb_pct": <float>, "vs_lhb": <float>, "vs_rhb": <float>\n'
-    '  },\n'
-    '  "home_pitcher": {\n'
-    '    "name": "<string>", "xfip": <float>, "siera": <float>,\n'
-    '    "k_bb_pct": <float>, "vs_lhb": <float>, "vs_rhb": <float>\n'
-    '  },\n'
-    '  "away_offense": { "wrc_plus": <float>, "iso": <float>, "ops": <float> },\n'
-    '  "home_offense": { "wrc_plus": <float>, "iso": <float>, "ops": <float> },\n'
-    '  "away_bullpen": {\n'
-    '    "rested_key_relievers": <int 0-5>,\n'
-    '    "aggregate_xfip": <float>,\n'
-    '    "fatigue_flag": "<fresh|moderate|taxed>"\n'
-    '  },\n'
-    '  "home_bullpen": {\n'
-    '    "rested_key_relievers": <int 0-5>,\n'
-    '    "aggregate_xfip": <float>,\n'
-    '    "fatigue_flag": "<fresh|moderate|taxed>"\n'
-    '  },\n'
-    '  "venue": {\n'
-    '    "park_factor": <float>,\n'
-    '    "hr_factor": <float>,\n'
-    '    "wind_speed_mph": <float>,\n'
-    '    "wind_direction": "<string>",\n'
-    '    "temp_f": <float>,\n'
-    '    "stadium_name": "<string>"\n'
-    '  },\n'
+    '  "away_pitcher": {"name": "<string>", "xfip": <float>, "siera": <float>, "k_bb_pct": <float>, "vs_lhb": <float>, "vs_rhb": <float>},\n'
+    '  "home_pitcher": {"name": "<string>", "xfip": <float>, "siera": <float>, "k_bb_pct": <float>, "vs_lhb": <float>, "vs_rhb": <float>},\n'
+    '  "away_offense": {"wrc_plus": <float>, "iso": <float>, "ops": <float>},\n'
+    '  "home_offense": {"wrc_plus": <float>, "iso": <float>, "ops": <float>},\n'
+    '  "away_bullpen": {"rested_key_relievers": <int 0-5>, "aggregate_xfip": <float>, "fatigue_flag": "<fresh|moderate|taxed>"},\n'
+    '  "home_bullpen": {"rested_key_relievers": <int 0-5>, "aggregate_xfip": <float>, "fatigue_flag": "<fresh|moderate|taxed>"},\n'
+    '  "venue": {"park_factor": <float>, "hr_factor": <float>, "wind_speed_mph": <float>, "wind_direction": "<string>", "temp_f": <float>, "stadium_name": "<string>"},\n'
     '  "confidence": <float 0-1>\n'
     "}\n\n"
     "**REMINDER:** Output ONLY the raw JSON. No markdown code blocks. No text before or after. "
@@ -193,33 +163,29 @@ def _team_in_question(team_name: str, question: str) -> bool:
         return False
     q = question.lower()
     name = team_name.lower().strip()
-    # Direct substring match
     if name in q:
         return True
-    # Try individual words (e.g. "Yankees" matches "New York Yankees")
     for word in name.split():
         if len(word) > 3 and word in q:
             return True
-    # Try short/abbreviation forms (e.g. "NYY" for Yankees)
     return False
 
 
 def extract_mlb_markets_from_event(event: dict) -> list[dict]:
     """
     Extract moneyline markets from an MLB Polymarket event.
-    Handles multiple Gamma API question formats with robust matching.
-
-    Common Polymarket MLB question formats:
-      - "Will [Team A] win?" (moneyline)
-      - "[Team A] to win?"
-      - "Moneyline: [Team A]"
-      - "[Team A] @ [Team B] — [Team A] win?"
+    
+    Polymarket MLB formats (NO "win" keyword — unlike soccer):
+      - "[Team Name] (Moneyline)"  ← THE moneyline market
+      - "Moneyline: [Team Name]"
+      - Spread / O/U / props are IGNORED
+    
+    Also handles "Will [Team] win?" as fallback for older format events.
     """
     markets = event.get("markets", [])
     title = (event.get("title") or "").lower()
     teams = event.get("teams", [])
 
-    # Build team name lists
     team_names = []
     for t in teams:
         name = (t.get("name") or "").lower().strip()
@@ -243,19 +209,18 @@ def extract_mlb_markets_from_event(event: dict) -> list[dict]:
         if len(parts) >= 2:
             title_away, title_home = parts[0].lower(), parts[1].lower()
 
-    # ── DEBUG: dump all raw market data ──
+    # ── DEBUG ──
     print(f"[MLB Markets] Event title: '{title}'", file=sys.stderr)
     print(f"[MLB Markets] Teams from Gamma: away='{away_name}', home='{home_name}'", file=sys.stderr)
     print(f"[MLB Markets] Title teams: away='{title_away}', home='{title_home}'", file=sys.stderr)
+    print(f"[MLB Markets] All team names: {team_names}", file=sys.stderr)
     print(f"[MLB Markets] Total markets in event: {len(markets)}", file=sys.stderr)
-    for i, m in enumerate(markets):
-        q = m.get("question", "NO_QUESTION")
-        cids = m.get("clobTokenIds", "[]")
-        print(f"[MLB Markets]   [{i}] question='{q}' clobTokenIds={cids}", file=sys.stderr)
 
     result = []
-    for m in markets:
-        question = (m.get("question") or "").lower().strip()
+
+    for i, m in enumerate(markets):
+        question_raw = m.get("question", "")
+        question = question_raw.lower().strip()
         if not question:
             continue
 
@@ -270,98 +235,90 @@ def extract_mlb_markets_from_event(event: dict) -> list[dict]:
 
         token_id = clob_ids[0]
 
-        has_win = "win" in question
-        if not has_win:
-            # Also check "defeat" / "beat" patterns for moneyline
-            has_win = any(w in question for w in ["defeat", "beat", "moneyline"])
+        # ── Skip non-moneyline markets ──
+        # Spread markets, O/U, props, extra innings — ignore
+        skip_keywords = ["spread:", "o/u", "over/under", "innings",
+                         "extra innings", "1st 5", "strikeout", "home run",
+                         "hits", "runs", "total bases"]
+        is_skip = any(sk in question for sk in skip_keywords)
+        if is_skip:
+            print(f"[MLB Markets]   [{i}] SKIP (non-moneyline): '{question_raw[:80]}'", file=sys.stderr)
+            continue
 
-        away_matches_gamma = _team_in_question(away_name, question) if away_name else False
-        home_matches_gamma = _team_in_question(home_name, question) if home_name else False
-        away_matches_title = _team_in_question(title_away, question) if title_away else False
-        home_matches_title = _team_in_question(title_home, question) if title_home else False
+        # ── Determine if this is a moneyline market ──
+        is_moneyline = "moneyline" in question
 
-        effective_away = away_matches_gamma or away_matches_title
-        effective_home = home_matches_gamma or home_matches_title
+        # Also check old format: "Will [Team] win?"
+        is_win_format = "win" in question
 
+        if not is_moneyline and not is_win_format:
+            print(f"[MLB Markets]   [{i}] SKIP (no moneyline/win keyword): '{question_raw[:80]}'", file=sys.stderr)
+            continue
+
+        # ── Determine which team this market is for ──
         market_type = None
 
-        # Strategy 1: clear win keyword + single team match
-        if has_win and effective_away and not effective_home:
-            market_type = "away"
-        elif has_win and effective_home and not effective_away:
-            market_type = "home"
-        elif has_win and effective_away and effective_home:
-            # Both teams mentioned — figure out which is the subject
-            # Check "beat" / "defeat": "Home beat Away" → home is subject
-            if any(w in question for w in ["beat", "defeat"]):
-                # The subject (winner) comes before "beat"/"defeat"
-                for w in ["beat", "defeat"]:
-                    if w in question:
-                        subject_part = question.split(w)[0].strip()
-                        if _team_in_question(away_name, subject_part):
-                            market_type = "away"
-                        elif _team_in_question(home_name, subject_part):
-                            market_type = "home"
-                        elif _team_in_question(title_away, subject_part):
-                            market_type = "away"
-                        elif _team_in_question(title_home, subject_part):
-                            market_type = "home"
-                        break
-            else:
-                # "Will Away win vs Home?" → first team mentioned is the subject
-                away_pos = question.find(away_name) if away_name and away_name in question else 999
-                home_pos = question.find(home_name) if home_name and home_name in question else 999
-                market_type = "away" if away_pos < home_pos else "home"
-
-        # Strategy 2: fallback — try title team names
-        if market_type is None and has_win:
-            if away_matches_title and not home_matches_title:
+        # Strategy 1: "(Moneyline)" format — team name appears before "(moneyline)"
+        if is_moneyline:
+            # "[Team Name] (Moneyline)" → team is the subject
+            if _team_in_question(away_name, question):
                 market_type = "away"
-            elif home_matches_title and not away_matches_title:
+            elif _team_in_question(home_name, question):
+                market_type = "home"
+            elif _team_in_question(title_away, question):
+                market_type = "away"
+            elif _team_in_question(title_home, question):
                 market_type = "home"
 
-        # Strategy 3: brute force — match ANY team name from the full list
-        if market_type is None and has_win:
-            matched_teams = []
-            for i, name in enumerate(team_names):
+        # Strategy 2: "Will [Team] win?" format (fallback)
+        if market_type is None and is_win_format:
+            if _team_in_question(away_name, question) and not _team_in_question(home_name, question):
+                market_type = "away"
+            elif _team_in_question(home_name, question) and not _team_in_question(away_name, question):
+                market_type = "home"
+            elif _team_in_question(away_name, question) and _team_in_question(home_name, question):
+                away_pos = question.find(away_name) if away_name in question else 999
+                home_pos = question.find(home_name) if home_name in question else 999
+                market_type = "away" if away_pos < home_pos else "home"
+
+        # Strategy 3: brute force — match from full team name list
+        if market_type is None:
+            for i_name, name in enumerate(team_names):
                 if _team_in_question(name, question):
-                    # Determine if this is away (even index) or home (odd index)
-                    half = len(team_names) / 2
-                    side = "away" if i < half else "home"
-                    matched_teams.append(side)
-            if len(set(matched_teams)) == 1:
-                market_type = matched_teams[0]
+                    half = max(len(team_names) // 2, 1)
+                    market_type = "away" if i_name < half else "home"
+                    break
 
         if market_type:
             result.append({
                 "type": market_type,
                 "token_id": token_id,
-                "question": m.get("question", ""),
+                "question": question_raw,
                 "slug": m.get("slug", ""),
             })
-            print(f"[MLB Markets]   → MATCHED: type={market_type} question='{m.get('question','')[:80]}'", file=sys.stderr)
+            print(f"[MLB Markets]   [{i}] MATCHED: type={market_type} question='{question_raw[:80]}'", file=sys.stderr)
+        else:
+            print(f"[MLB Markets]   [{i}] UNMATCHED (could not determine team): '{question_raw[:80]}'", file=sys.stderr)
 
-    print(f"[MLB Markets] Total matched: {len(result)} (away={sum(1 for r in result if r['type']=='away')}, home={sum(1 for r in result if r['type']=='home')})", file=sys.stderr)
+    away_count = sum(1 for r in result if r['type'] == 'away')
+    home_count = sum(1 for r in result if r['type'] == 'home')
+    print(f"[MLB Markets] Total matched: {len(result)} (away={away_count}, home={home_count})", file=sys.stderr)
     return result
 
 
 def extract_pitchers_from_event(event: dict) -> tuple:
     away_pitcher = "TBD"
     home_pitcher = "TBD"
-
-    # Check event-level metadata
     for key in ["awayPitcher", "away_pitcher", "pitcherAway"]:
         val = event.get(key) or (event.get("metadata") or {}).get(key)
         if val and isinstance(val, str) and val.strip():
             away_pitcher = val.strip()
             break
-
     for key in ["homePitcher", "home_pitcher", "pitcherHome"]:
         val = event.get(key) or (event.get("metadata") or {}).get(key)
         if val and isinstance(val, str) and val.strip():
             home_pitcher = val.strip()
             break
-
     return away_pitcher, home_pitcher
 
 
@@ -375,7 +332,6 @@ def extract_stadium_from_event(event: dict) -> str:
                     return n.strip()
         if isinstance(val, str) and val.strip():
             return val.strip()
-
     meta = event.get("metadata") or event.get("meta") or {}
     if isinstance(meta, dict):
         for key in ["venue", "stadium", "location", "ballpark"]:
@@ -387,7 +343,6 @@ def extract_stadium_from_event(event: dict) -> str:
                         return n.strip()
             if isinstance(val, str) and val.strip():
                 return val.strip()
-
     return "Unknown"
 
 
@@ -409,20 +364,17 @@ def fetch_clob_best_ask(token_id: str) -> Optional[float]:
         with urllib.request.urlopen(req, timeout=5.0) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode("utf-8"))
-                price_str = data.get("price", "0")
-                return float(price_str)
+                return float(data.get("price", "0"))
     except Exception as e:
         print(f"[CLOB] Price fetch failed for token {token_id}: {e}", file=sys.stderr)
     return None
 
 
 def share_price_to_decimal_odds(price: float) -> float:
-    if price <= 0:
-        return float("inf")
-    return 1.0 / price
+    return 1.0 / price if price > 0 else float("inf")
 
 
-# ── OpenAI Sabermetric Engine ───────────────────────────────
+# ── OpenAI ──────────────────────────────────────────────────
 
 def get_openai_client() -> AsyncOpenAI:
     if not SURPLUS_API_KEY:
@@ -500,7 +452,6 @@ async def fetch_sabermetric_variables(
             print(f"[OpenAI] Full response object:", file=sys.stderr)
             print(f"  model: {response.model}", file=sys.stderr)
             print(f"  usage: {response.usage}", file=sys.stderr)
-            print(f"  choices count: {len(response.choices)}", file=sys.stderr)
             if response.choices:
                 choice = response.choices[0]
                 print(f"  finish_reason: {choice.finish_reason}", file=sys.stderr)
@@ -516,13 +467,13 @@ async def fetch_sabermetric_variables(
                 if response.choices:
                     finish = choice.finish_reason
                     if finish == "length":
-                        print(f"[OpenAI] {mode_label}: finish_reason=length — response truncated.", file=sys.stderr)
+                        print(f"[OpenAI] {mode_label}: finish_reason=length — truncated.", file=sys.stderr)
                         last_error = ValueError(f"{mode_label} mode: finish_reason=length")
                     else:
-                        print(f"[OpenAI] {mode_label}: returned empty content (finish_reason={finish})", file=sys.stderr)
-                        last_error = ValueError(f"{mode_label} mode returned empty response (finish_reason={finish})")
+                        print(f"[OpenAI] {mode_label}: empty content (finish_reason={finish})", file=sys.stderr)
+                        last_error = ValueError(f"{mode_label} mode returned empty (finish_reason={finish})")
                 else:
-                    last_error = ValueError(f"{mode_label} mode: response has no choices")
+                    last_error = ValueError(f"{mode_label} mode: no choices")
         except ValueError as e:
             last_error = e
             if raw and raw.strip():
@@ -602,8 +553,7 @@ def sabermetrics_to_probabilities(sm: SabermetricOutput) -> dict:
     home_edge = (home_pitching_edge + home_kbb_edge + home_offense_edge + home_iso_edge
                + home_bullpen_edge + home_hr_edge + home_field_advantage + park_modifier)
 
-    def sigmoid(x: float) -> float:
-        return 1.0 / (1.0 + math.exp(-x))
+    def sigmoid(x): return 1.0 / (1.0 + math.exp(-x))
 
     net_edge = away_edge - home_edge
     away_prob = sigmoid(math.log(0.46 / 0.54) + net_edge * 3.0)
@@ -620,7 +570,6 @@ def sabermetrics_to_probabilities(sm: SabermetricOutput) -> dict:
         parts.append(f"Park: {sm.venue.stadium_name} factor {sm.venue.park_factor:.0f}")
     if sm.away_bullpen.fatigue_flag or sm.home_bullpen.fatigue_flag:
         parts.append(f"Bullpen: AWAY {sm.away_bullpen.fatigue_flag or 'normal'} | HOME {sm.home_bullpen.fatigue_flag or 'normal'}")
-
     justification = " | ".join(parts) if parts else "Insufficient sabermetric data"
 
     return {"away_prob": away_prob, "home_prob": home_prob, "justification": justification}
@@ -632,11 +581,11 @@ def calculate_ev(probs: dict, clob_prices: dict) -> dict:
         "home": {"prob": probs["home_prob"], "price": None, "odds": None, "ev": None, "token_id": None},
     }
     for outcome in ["away", "home"]:
-        price_data = clob_prices.get(outcome)
-        if price_data and price_data.get("price") is not None:
-            price = price_data["price"]
+        pd = clob_prices.get(outcome)
+        if pd and pd.get("price") is not None:
+            price = pd["price"]
             results[outcome]["price"] = price
-            results[outcome]["token_id"] = price_data.get("token_id")
+            results[outcome]["token_id"] = pd.get("token_id")
             if price > 0:
                 odds = share_price_to_decimal_odds(price)
                 results[outcome]["odds"] = odds
@@ -677,23 +626,12 @@ ev_thresholds = {}
 kelly_fractions = {}
 bankrolls = {}
 
-def get_ev_threshold(guild_id: int) -> float:
-    return ev_thresholds.get(guild_id, DEFAULT_EV_THRESHOLD)
-
-def set_ev_threshold(guild_id: int, threshold: float):
-    ev_thresholds[guild_id] = threshold
-
-def get_kelly_fraction(guild_id: int) -> float:
-    return kelly_fractions.get(guild_id, DEFAULT_KELLY_FRACTION)
-
-def set_kelly_fraction(guild_id: int, fraction: float):
-    kelly_fractions[guild_id] = fraction
-
-def get_bankroll(guild_id: int) -> float:
-    return bankrolls.get(guild_id, DEFAULT_BANKROLL)
-
-def set_bankroll(guild_id: int, bankroll: float):
-    bankrolls[guild_id] = bankroll
+def get_ev_threshold(gid): return ev_thresholds.get(gid, DEFAULT_EV_THRESHOLD)
+def set_ev_threshold(gid, t): ev_thresholds[gid] = t
+def get_kelly_fraction(gid): return kelly_fractions.get(gid, DEFAULT_KELLY_FRACTION)
+def set_kelly_fraction(gid, f): kelly_fractions[gid] = f
+def get_bankroll(gid): return bankrolls.get(gid, DEFAULT_BANKROLL)
+def set_bankroll(gid, b): bankrolls[gid] = b
 
 
 @bot.command(name="mlb")
@@ -701,7 +639,7 @@ async def cmd_mlb(ctx, *, args: str = ""):
     print(f"[MLB CMD] Received !mlb from {ctx.author} with args: '{args}'", file=sys.stderr)
 
     if not args:
-        help_text = (
+        await ctx.send(
             "**MLB Sabermetric Bot — Kelly Criterion Mode**\n"
             "`!mlb <polymarket_url>` — Analyze MLB match, show EV + Kelly stakes\n"
             "`!mlb threshold <0.05>` — Set EV threshold (e.g. 0.05 = 5%)\n"
@@ -713,72 +651,51 @@ async def cmd_mlb(ctx, *, args: str = ""):
             "2. Python calculates true win probability from those variables\n"
             "3. Kelly Criterion determines optimal stakes for +EV outcomes"
         )
-        await ctx.send(help_text)
         return
 
     try:
         if args.lower().startswith("threshold"):
-            try:
-                parts = args.split()
-                if len(parts) >= 2:
-                    new_threshold = float(parts[1])
-                    gid = ctx.guild.id if ctx.guild else ctx.author.id
-                    set_ev_threshold(gid, new_threshold)
-                    await ctx.send(f"✅ EV threshold set to **{new_threshold*100:.1f}%**")
-                    return
-            except ValueError:
-                await ctx.send("❌ Invalid threshold. Use: `!mlb threshold 0.05`")
-                return
+            parts = args.split()
+            if len(parts) >= 2:
+                gid = ctx.guild.id if ctx.guild else ctx.author.id
+                set_ev_threshold(gid, float(parts[1]))
+                await ctx.send(f"✅ EV threshold set to **{float(parts[1])*100:.1f}%**")
+            return
 
         if args.lower().startswith("kelly"):
-            try:
-                parts = args.split()
-                if len(parts) >= 2:
-                    new_kelly = float(parts[1])
-                    if new_kelly <= 0 or new_kelly > 1.0:
-                        await ctx.send("❌ Kelly fraction must be between 0.01 and 1.0")
-                        return
-                    gid = ctx.guild.id if ctx.guild else ctx.author.id
-                    set_kelly_fraction(gid, new_kelly)
-                    label = "full-Kelly" if new_kelly == 1.0 else f"{new_kelly*100:.0f}%-Kelly"
-                    await ctx.send(f"✅ Kelly fraction set to **{new_kelly}** ({label})")
-                    return
-            except ValueError:
-                await ctx.send("❌ Invalid Kelly fraction. Use: `!mlb kelly 0.5`")
-                return
+            parts = args.split()
+            if len(parts) >= 2:
+                v = float(parts[1])
+                if v <= 0 or v > 1.0:
+                    await ctx.send("❌ Kelly fraction must be between 0.01 and 1.0"); return
+                gid = ctx.guild.id if ctx.guild else ctx.author.id
+                set_kelly_fraction(gid, v)
+                label = "full-Kelly" if v == 1.0 else f"{v*100:.0f}%-Kelly"
+                await ctx.send(f"✅ Kelly fraction set to **{v}** ({label})")
+            return
 
         if args.lower().startswith("bankroll"):
-            try:
-                parts = args.split()
-                if len(parts) >= 2:
-                    new_br = float(parts[1])
-                    if new_br <= 0:
-                        await ctx.send("❌ Bankroll must be positive")
-                        return
-                    gid = ctx.guild.id if ctx.guild else ctx.author.id
-                    set_bankroll(gid, new_br)
-                    await ctx.send(f"✅ Bankroll set to **${new_br:,.2f}**")
-                    return
-            except ValueError:
-                await ctx.send("❌ Invalid bankroll. Use: `!mlb bankroll 1000`")
-                return
+            parts = args.split()
+            if len(parts) >= 2:
+                v = float(parts[1])
+                if v <= 0:
+                    await ctx.send("❌ Bankroll must be positive"); return
+                gid = ctx.guild.id if ctx.guild else ctx.author.id
+                set_bankroll(gid, v)
+                await ctx.send(f"✅ Bankroll set to **${v:,.2f}**")
+            return
 
         url = args.strip()
-        print(f"[MLB CMD] URL to analyze: '{url}'", file=sys.stderr)
-
         slug = parse_polymarket_url(url)
         if not slug:
-            await ctx.send("❌ Could not extract event slug from URL.")
-            return
+            await ctx.send("❌ Could not extract event slug from URL."); return
 
         print(f"[MLB CMD] Extracted slug: '{slug}'", file=sys.stderr)
 
         async with ctx.typing():
-            print(f"[MLB CMD] Fetching Gamma event for slug: {slug}", file=sys.stderr)
             event = await asyncio.to_thread(fetch_event_from_gamma, slug)
             if not event:
-                await ctx.send(f"❌ Event not found for slug `{slug}`.")
-                return
+                await ctx.send(f"❌ Event not found for slug `{slug}`."); return
 
             print(f"[MLB CMD] Gamma event found: {event.get('title', '?')}", file=sys.stderr)
 
@@ -788,24 +705,18 @@ async def cmd_mlb(ctx, *, args: str = ""):
             home_team = teams[1].get("name", "Home") if len(teams) >= 2 else "Home"
 
             series = event.get("series", [])
-            league = "MLB"
-            if isinstance(series, list) and len(series) > 0:
-                league = series[0].get("title", "MLB")
-
+            league = series[0].get("title", "MLB") if isinstance(series, list) and series else "MLB"
             match_date = event.get("startDate") or event.get("scheduledStart") or "Unknown"
             away_pitcher, home_pitcher = extract_pitchers_from_event(event)
             stadium_name = extract_stadium_from_event(event)
 
-            # ── Extract markets with full debug logging ──
             markets = extract_mlb_markets_from_event(event)
 
             if len(markets) < 2:
                 await ctx.send(
                     f"❌ Could not find enough MLB moneyline markets (away/home). Found: {len(markets)}.\n"
-                    f"Event: `{title}`\n"
-                    f"Markets in event: {len(event.get('markets', []))}\n"
-                    f"Check the server logs for full market dump — the Gamma API question format may differ from what we expect.\n"
-                    f"Paste the `[MLB Markets]` lines from `journalctl -u mlbbot` so I can fix the parser."
+                    f"Event: `{title}`\nMarkets in event: {len(event.get('markets', []))}\n"
+                    f"Check the server logs for full market dump."
                 )
                 return
 
@@ -816,8 +727,9 @@ async def cmd_mlb(ctx, *, args: str = ""):
 
             if "away" not in market_lookup or "home" not in market_lookup:
                 await ctx.send(
-                    f"❌ Found markets but not both away/home. Away: {'yes' if 'away' in market_lookup else 'NO'}, "
-                    f"Home: {'yes' if 'home' in market_lookup else 'NO'}.\nCheck the logs for market dump."
+                    f"❌ Found markets but not both away/home. "
+                    f"Away: {'yes' if 'away' in market_lookup else 'NO'}, "
+                    f"Home: {'yes' if 'home' in market_lookup else 'NO'}."
                 )
                 return
 
@@ -826,13 +738,9 @@ async def cmd_mlb(ctx, *, args: str = ""):
                 m = market_lookup.get(outcome_type)
                 if m:
                     price = await asyncio.to_thread(fetch_clob_best_ask, m["token_id"])
-                    clob_prices[outcome_type] = {
-                        "price": price, "token_id": m["token_id"],
-                        "question": m.get("question", ""),
-                    }
+                    clob_prices[outcome_type] = {"price": price, "token_id": m["token_id"], "question": m.get("question", "")}
 
-            print(f"[MLB CMD] CLOB prices: away={clob_prices.get('away',{}).get('price')}, "
-                  f"home={clob_prices.get('home',{}).get('price')}", file=sys.stderr)
+            print(f"[MLB CMD] CLOB prices: away={clob_prices.get('away',{}).get('price')}, home={clob_prices.get('home',{}).get('price')}", file=sys.stderr)
 
             print(f"[MLB CMD] Calling sabermetric AI for: {title}", file=sys.stderr)
             try:
@@ -845,28 +753,24 @@ async def cmd_mlb(ctx, *, args: str = ""):
                 await ctx.send(f"❌ **Sabermetric Engine Error**: {type(e).__name__}: {e}\nCheck SURPLUS_API_KEY and model `{SURPLUS_MODEL}`.")
                 return
 
-            print(f"[MLB CMD] Sabermetrics received: away_xFIP={sm.away_pitcher.xfip}, "
-                  f"home_xFIP={sm.home_pitcher.xfip}, park_factor={sm.venue.park_factor}", file=sys.stderr)
-
             probs = sabermetrics_to_probabilities(sm)
             ev_results = calculate_ev(probs, clob_prices)
             gid = ctx.guild.id if ctx.guild else ctx.author.id
             threshold = get_ev_threshold(gid)
             kelly_frac = get_kelly_fraction(gid)
             bankroll = get_bankroll(gid)
-
             kelly_label = "Full-Kelly" if kelly_frac == 1.0 else f"{kelly_frac*100:.0f}%-Kelly"
+
             embed = discord.Embed(
                 title=f"⚾ MLB Sabermetric Analysis: {sm.match_name}",
-                description=(
-                    f"**League:** {league} | **Date:** {match_date}\n"
-                    f"**Venue:** {sm.venue.stadium_name}\n"
-                    f"**Slug:** `{slug}`\n"
-                    f"**Staking:** {kelly_label} | **Bankroll:** ${bankroll:,.2f} | **Threshold:** {threshold*100:.1f}%"
-                ),
+                description=(f"**League:** {league} | **Date:** {match_date}\n"
+                           f"**Venue:** {sm.venue.stadium_name}\n"
+                           f"**Slug:** `{slug}`\n"
+                           f"**Staking:** {kelly_label} | **Bankroll:** ${bankroll:,.2f} | **Threshold:** {threshold*100:.1f}%"),
                 color=discord.Color.dark_green(),
             )
 
+            # Pitchers
             pitcher_lines = []
             if sm.away_pitcher.xfip and sm.home_pitcher.xfip:
                 p1 = f"**{sm.away_pitcher.name}** (AWAY): xFIP {sm.away_pitcher.xfip:.2f}"
@@ -878,9 +782,10 @@ async def cmd_mlb(ctx, *, args: str = ""):
                 if sm.home_pitcher.k_bb_pct: p2 += f" | K-BB% {sm.home_pitcher.k_bb_pct:.1f}%"
                 pitcher_lines.append(p2)
             else:
-                pitcher_lines.append(f"Pitchers: {sm.away_pitcher.name} vs {sm.home_pitcher.name}")
+                pitcher_lines.append(f"{sm.away_pitcher.name} vs {sm.home_pitcher.name}")
             embed.add_field(name="🎯 Starting Pitchers", value="\n".join(pitcher_lines), inline=False)
 
+            # Offense
             offense_lines = []
             if sm.away_offense.wrc_plus and sm.home_offense.wrc_plus:
                 o1 = f"**{sm.away_team}**: wRC+ {sm.away_offense.wrc_plus:.0f}"
@@ -894,6 +799,7 @@ async def cmd_mlb(ctx, *, args: str = ""):
             if offense_lines:
                 embed.add_field(name="⚡ Offensive Efficiency", value="\n".join(offense_lines), inline=False)
 
+            # Bullpen
             bullpen_lines = []
             for side, team_name, bp in [("away", sm.away_team, sm.away_bullpen), ("home", sm.home_team, sm.home_bullpen)]:
                 if bp.fatigue_flag:
@@ -904,6 +810,7 @@ async def cmd_mlb(ctx, *, args: str = ""):
             if bullpen_lines:
                 embed.add_field(name="🫀 Bullpen Availability (72hr)", value="\n".join(bullpen_lines), inline=False)
 
+            # Venue
             venue_lines = []
             if sm.venue.park_factor:
                 v = f"Park Factor: **{sm.venue.park_factor:.0f}**"
@@ -916,69 +823,44 @@ async def cmd_mlb(ctx, *, args: str = ""):
             if venue_lines:
                 embed.add_field(name=f"🏟️ Venue — {sm.venue.stadium_name}", value="\n".join(venue_lines), inline=False)
 
-            embed.add_field(
-                name="📊 Python Win Probabilities (from Sabermetrics)",
-                value=(f"🚶 **{sm.away_team}**: {probs['away_prob']*100:.1f}%\n"
-                       f"🏠 **{sm.home_team}**: {probs['home_prob']*100:.1f}%"),
-                inline=False,
-            )
-            embed.add_field(name="📐 Calculation Justification", value=probs["justification"], inline=False)
+            embed.add_field(name="📊 Python Win Probabilities (from Sabermetrics)",
+                          value=f"🚶 **{sm.away_team}**: {probs['away_prob']*100:.1f}%\n🏠 **{sm.home_team}**: {probs['home_prob']*100:.1f}%",
+                          inline=False)
+            embed.add_field(name="📐 Justification", value=probs["justification"], inline=False)
 
             ev_lines = []
             kelly_lines = []
-            positive_ev_outcomes = []
-
+            positive_ev = []
             for outcome, label, emoji in [("away", sm.away_team, "🚶"), ("home", sm.home_team, "🏠")]:
                 r = ev_results[outcome]
-                price_str = f"{r['price']*100:.1f}¢" if r["price"] is not None else "N/A"
-                odds_str = f"{r['odds']:.2f}" if r["odds"] is not None else "N/A"
-                ev_str = f"{r['ev']*100:+.1f}%" if r["ev"] is not None else "N/A"
-
+                ps = f"{r['price']*100:.1f}¢" if r["price"] is not None else "N/A"
+                os_ = f"{r['odds']:.2f}" if r["odds"] is not None else "N/A"
+                es = f"{r['ev']*100:+.1f}%" if r["ev"] is not None else "N/A"
                 if r["ev"] is not None and r["ev"] >= threshold and r["odds"] is not None:
-                    ev_lines.append(f"✅ {emoji} **{label}**: Price {price_str} | Odds {odds_str} | EV **{ev_str}**")
-                    positive_ev_outcomes.append(outcome)
-                    kelly = calculate_kelly_bet(r["ev"], r["prob"], r["odds"], bankroll, kelly_frac, threshold)
-                    if kelly:
-                        kelly_lines.append(
-                            f"{emoji} **{label}**: Stake **${kelly['stake']:,.2f}** "
-                            f"({kelly['scaled_kelly_pct']:.1f}% of bankroll)\n"
-                            f"　↳ Full Kelly: {kelly['full_kelly_pct']:.1f}% | "
-                            f"Expected profit: **${kelly['expected_profit']:,.2f}** ({kelly['expected_roi_pct']:+.1f}% ROI)"
-                        )
+                    ev_lines.append(f"✅ {emoji} **{label}**: Price {ps} | Odds {os_} | EV **{es}**")
+                    positive_ev.append(outcome)
+                    k = calculate_kelly_bet(r["ev"], r["prob"], r["odds"], bankroll, kelly_frac, threshold)
+                    if k:
+                        kelly_lines.append(f"{emoji} **{label}**: Stake **${k['stake']:,.2f}** ({k['scaled_kelly_pct']:.1f}% of bankroll)\n"
+                                         f"　↳ Full Kelly: {k['full_kelly_pct']:.1f}% | Expected profit: **${k['expected_profit']:,.2f}** ({k['expected_roi_pct']:+.1f}% ROI)")
                 elif r["ev"] is not None:
-                    ev_lines.append(f"❌ {emoji} **{label}**: Price {price_str} | Odds {odds_str} | EV {ev_str}")
+                    ev_lines.append(f"❌ {emoji} **{label}**: Price {ps} | Odds {os_} | EV {es}")
                 else:
-                    ev_lines.append(f"⚪ {emoji} **{label}**: Price {price_str} | No EV data")
+                    ev_lines.append(f"⚪ {emoji} **{label}**: Price {ps} | No EV data")
 
-            embed.add_field(name="CLOB Prices & EV", value="\n".join(ev_lines) if ev_lines else "No EV data available", inline=False)
-
+            embed.add_field(name="CLOB Prices & EV", value="\n".join(ev_lines) if ev_lines else "No EV data", inline=False)
             if kelly_lines:
                 embed.add_field(name=f"💰 Kelly Stakes ({kelly_label}, Bankroll: ${bankroll:,.2f})", value="\n".join(kelly_lines), inline=False)
-
             embed.add_field(name="AI Confidence", value=f"{sm.confidence*100:.0f}%", inline=True)
 
-            if positive_ev_outcomes:
-                total_stake = sum(
-                    calculate_kelly_bet(ev_results[o]["ev"], ev_results[o]["prob"],
-                        ev_results[o]["odds"], bankroll, kelly_frac, threshold)["stake"]
-                    for o in positive_ev_outcomes
-                )
-                total_expected = sum(
-                    calculate_kelly_bet(ev_results[o]["ev"], ev_results[o]["prob"],
-                        ev_results[o]["odds"], bankroll, kelly_frac, threshold)["expected_profit"]
-                    for o in positive_ev_outcomes
-                )
-                total_kelly_pct = (total_stake / bankroll) * 100 if bankroll > 0 else 0
-                embed.add_field(name="📋 Bet Summary", value=(
-                    f"**{len(positive_ev_outcomes)}** +EV outcome(s)\n"
-                    f"Total stake: **${total_stake:,.2f}** ({total_kelly_pct:.1f}% of bankroll)\n"
-                    f"Total expected profit: **${total_expected:,.2f}**"
-                ), inline=True)
+            if positive_ev:
+                total_stake = sum(calculate_kelly_bet(ev_results[o]["ev"], ev_results[o]["prob"], ev_results[o]["odds"], bankroll, kelly_frac, threshold)["stake"] for o in positive_ev)
+                total_exp = sum(calculate_kelly_bet(ev_results[o]["ev"], ev_results[o]["prob"], ev_results[o]["odds"], bankroll, kelly_frac, threshold)["expected_profit"] for o in positive_ev)
+                embed.add_field(name="📋 Bet Summary", value=f"**{len(positive_ev)}** +EV outcome(s)\nTotal stake: **${total_stake:,.2f}** ({(total_stake/bankroll)*100:.1f}% of bankroll)\nTotal expected profit: **${total_exp:,.2f}**", inline=True)
             else:
                 embed.add_field(name="📋 Bet Summary", value="No +EV outcomes above threshold — no bets recommended.", inline=True)
 
-            embed.set_footer(text=f"Engine: {SURPLUS_MODEL} via Surplus | Kelly: f* = EV/(odds−1) × {kelly_frac} | Max 25%/bet | Python calc")
-
+            embed.set_footer(text=f"Engine: {SURPLUS_MODEL} via Surplus | Kelly: f* = EV/(odds−1) × {kelly_frac} | Max 25%/bet")
             await ctx.send(embed=embed)
             print(f"[MLB CMD] Embed sent successfully", file=sys.stderr)
 
@@ -999,8 +881,7 @@ async def cmd_mlb_status(ctx):
     bankroll = get_bankroll(gid)
     api_status = "✅ Configured" if SURPLUS_API_KEY else "❌ Not set"
     kelly_label = "Full-Kelly" if kelly_frac == 1.0 else f"{kelly_frac*100:.0f}%-Kelly"
-
-    embed = discord.Embed(
+    await ctx.send(embed=discord.Embed(
         title="⚾ MLB Bot Status",
         description="\n".join([
             f"**Mode:** MLB Sabermetric + Kelly Criterion",
@@ -1012,29 +893,21 @@ async def cmd_mlb_status(ctx):
             f"**Architecture:** LLM → Sabermetrics → Python × Kelly = EV",
         ]),
         color=discord.Color.green() if SURPLUS_API_KEY else discord.Color.orange(),
-    )
-    await ctx.send(embed=embed)
+    ))
 
 
 @bot.event
 async def on_ready():
-    print(f"[MLB Bot] ========================================", file=sys.stderr)
     print(f"[MLB Bot] Online: {bot.user.name} ({bot.user.id})", file=sys.stderr)
-    print(f"[MLB Bot] Mode: Sabermetric → Python Probabilities → Kelly", file=sys.stderr)
-    print(f"[MLB Bot] Model: {SURPLUS_MODEL}", file=sys.stderr)
-    print(f"[MLB Bot] EV Threshold: {DEFAULT_EV_THRESHOLD*100:.1f}%", file=sys.stderr)
-    print(f"[MLB Bot] Kelly Fraction: {DEFAULT_KELLY_FRACTION}", file=sys.stderr)
-    print(f"[MLB Bot] Bankroll: ${DEFAULT_BANKROLL:,.2f}", file=sys.stderr)
-    print(f"[MLB Bot] API Key Set: {'Yes' if SURPLUS_API_KEY else 'NO — !mlb will fail'}", file=sys.stderr)
-    print(f"[MLB Bot] ========================================", file=sys.stderr)
+    print(f"[MLB Bot] Model: {SURPLUS_MODEL} | EV Threshold: {DEFAULT_EV_THRESHOLD*100:.1f}% | Kelly: {DEFAULT_KELLY_FRACTION} | Bankroll: ${DEFAULT_BANKROLL:,.2f}", file=sys.stderr)
+    print(f"[MLB Bot] API Key Set: {'Yes' if SURPLUS_API_KEY else 'NO'}", file=sys.stderr)
 
 
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
-    print(f"[MLB Bot Error] Command '{ctx.command}': {type(error).__name__}: {error}", file=sys.stderr)
-    traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
+    print(f"[MLB Bot Error] {type(error).__name__}: {error}", file=sys.stderr)
     try:
         await ctx.send(f"❌ **Command Error**: {type(error).__name__}: {error}")
     except Exception:
@@ -1053,18 +926,12 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
     def shutdown():
-        print("[MLB Bot] Shutting down...", file=sys.stderr)
         for task in asyncio.all_tasks(loop):
             task.cancel()
-
     for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, shutdown)
-        except NotImplementedError:
-            pass
-
+        try: loop.add_signal_handler(sig, shutdown)
+        except NotImplementedError: pass
     try:
         loop.run_until_complete(main())
     except KeyboardInterrupt:
