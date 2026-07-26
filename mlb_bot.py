@@ -32,6 +32,12 @@ DEFAULT_EV_THRESHOLD = float(os.getenv("EV_THRESHOLD", "0.05"))
 DEFAULT_KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.5"))
 DEFAULT_BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
 
+# ── Helpers ─────────────────────────────────────────────────
+
+def _strip_none(d: dict) -> dict:
+    """Remove keys with None values so Pydantic defaults apply."""
+    return {k: v for k, v in d.items() if v is not None}
+
 # ── Pydantic Output Schema ──────────────────────────────────
 
 class PitcherData(BaseModel):
@@ -113,8 +119,8 @@ SYSTEM_PROMPT = (
     '  "away_team": "<string>",\n'
     '  "home_team": "<string>",\n'
     '  "match_name": "<string>",\n'
-    '  "away_pitcher": {"name": "<string>", "handedness": "<L|R>", "xfip": <float|null>, "siera": <float|null>, "k_bb_pct": <float|null>, "vs_lhb": <float|null>, "vs_rhb": <float|null>},\n'
-    '  "home_pitcher": {"name": "<string>", "handedness": "<L|R>", "xfip": <float|null>, "siera": <float|null>, "k_bb_pct": <float|null>, "vs_lhb": <float|null>, "vs_rhb": <float|null>},\n'
+    '  "away_pitcher": {"name": "<string>", "handedness": "L or R (never null)", "xfip": <float|null>, "siera": <float|null>, "k_bb_pct": <float|null>, "vs_lhb": <float|null>, "vs_rhb": <float|null>},\n'
+    '  "home_pitcher": {"name": "<string>", "handedness": "L or R (never null)", "xfip": <float|null>, "siera": <float|null>, "k_bb_pct": <float|null>, "vs_lhb": <float|null>, "vs_rhb": <float|null>},\n'
     '  "away_offense": {"wrc_plus": <float|null>, "iso": <float|null>, "ops": <float|null>},\n'
     '  "home_offense": {"wrc_plus": <float|null>, "iso": <float|null>, "ops": <float|null>},\n'
     '  "away_bullpen": {"rested_key_relievers": <int 0-5|null>, "aggregate_xfip": <float|null>, "fatigue_flag": "<fresh|moderate|taxed|null>"},\n'
@@ -124,7 +130,8 @@ SYSTEM_PROMPT = (
     "}\n\n"
     "**REMINDER:** Output ONLY the raw JSON. No markdown code blocks. No text before or after. "
     "Do NOT include a 'home_win', 'draw', or 'away_win' field — those are calculated downstream. "
-    "Use null for any numeric field you cannot determine after exhaustive search (do not guess zero)."
+    "Use null for any numeric field you cannot determine after exhaustive search (do not guess zero). "
+    "IMPORTANT: handedness MUST be a string 'L' or 'R' — NEVER null. If unsure, default to 'R'."
 )
 
 USER_PROMPT_TEMPLATE = (
@@ -169,7 +176,6 @@ def fetch_event_from_gamma(slug: str) -> Optional[dict]:
 
 
 def _parse_json_array(val) -> list:
-    """Parse a JSON string array or return empty list."""
     if isinstance(val, list):
         return val
     if isinstance(val, str):
@@ -181,13 +187,6 @@ def _parse_json_array(val) -> list:
 
 
 def extract_mlb_markets_from_event(event: dict) -> list[dict]:
-    """
-    Extract moneyline markets from an MLB Polymarket event.
-
-    Uses Polymarket's own sportsMarketType field to identify the moneyline market.
-    The outcomes array tells us which team is away (index 0) vs home (index 1).
-    clobTokenIds[0] = away token, clobTokenIds[1] = home token.
-    """
     markets = event.get("markets", [])
     title = (event.get("title") or "").lower()
 
@@ -235,7 +234,7 @@ def extract_mlb_markets_from_event(event: dict) -> list[dict]:
         })
 
         print(f"[MLB Markets]   [{i}] -> MONEYLINE: away='{away_team}' home='{home_team}'", file=sys.stderr)
-        break  # only one moneyline market per event
+        break
 
     print(f"[MLB Markets] Total: {len(result)} (away={'yes' if any(r['type']=='away' for r in result) else 'NO'}, home={'yes' if any(r['type']=='home' for r in result) else 'NO'})", file=sys.stderr)
     return result
@@ -361,17 +360,18 @@ async def fetch_sabermetric_variables(
     if data is None:
         raise ValueError(f"All API modes failed. Model: {SURPLUS_MODEL}. Last error: {last_error}")
 
+    # Strip None values from nested dicts so Pydantic defaults apply
     return SabermetricOutput(
         away_team=str(data.get("away_team", away_team)),
         home_team=str(data.get("home_team", home_team)),
         match_name=str(data.get("match_name", match_title)),
-        away_pitcher=PitcherData(**data.get("away_pitcher", {})) if isinstance(data.get("away_pitcher"), dict) else PitcherData(),
-        home_pitcher=PitcherData(**data.get("home_pitcher", {})) if isinstance(data.get("home_pitcher"), dict) else PitcherData(),
-        away_offense=OffenseData(**data.get("away_offense", {})) if isinstance(data.get("away_offense"), dict) else OffenseData(),
-        home_offense=OffenseData(**data.get("home_offense", {})) if isinstance(data.get("home_offense"), dict) else OffenseData(),
-        away_bullpen=BullpenData(**data.get("away_bullpen", {})) if isinstance(data.get("away_bullpen"), dict) else BullpenData(),
-        home_bullpen=BullpenData(**data.get("home_bullpen", {})) if isinstance(data.get("home_bullpen"), dict) else BullpenData(),
-        venue=VenueData(**data.get("venue", {})) if isinstance(data.get("venue"), dict) else VenueData(),
+        away_pitcher=PitcherData(**_strip_none(data.get("away_pitcher", {}))) if isinstance(data.get("away_pitcher"), dict) else PitcherData(),
+        home_pitcher=PitcherData(**_strip_none(data.get("home_pitcher", {}))) if isinstance(data.get("home_pitcher"), dict) else PitcherData(),
+        away_offense=OffenseData(**_strip_none(data.get("away_offense", {}))) if isinstance(data.get("away_offense"), dict) else OffenseData(),
+        home_offense=OffenseData(**_strip_none(data.get("home_offense", {}))) if isinstance(data.get("home_offense"), dict) else OffenseData(),
+        away_bullpen=BullpenData(**_strip_none(data.get("away_bullpen", {}))) if isinstance(data.get("away_bullpen"), dict) else BullpenData(),
+        home_bullpen=BullpenData(**_strip_none(data.get("home_bullpen", {}))) if isinstance(data.get("home_bullpen"), dict) else BullpenData(),
+        venue=VenueData(**_strip_none(data.get("venue", {}))) if isinstance(data.get("venue"), dict) else VenueData(),
         confidence=float(data.get("confidence", 0.5)),
     )
 
