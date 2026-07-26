@@ -220,6 +220,39 @@ def _extract_json_from_text(text: str) -> dict:
         raise ValueError(f"Invalid JSON from LLM: {e}. Content: {preview}")
 
 
+def _extract_content_from_choice(choice) -> Optional[str]:
+    """
+    Extract the actual text content from a chat completion choice.
+    Handles reasoning models (o1, o3, gpt-5.5) that put output in
+    reasoning_content instead of content.
+    """
+    if not choice or not choice.message:
+        return None
+
+    msg = choice.message
+
+    # Standard content
+    content = msg.content
+    if content and content.strip():
+        return content
+
+    # Reasoning models put their final answer in reasoning_content
+    # (or sometimes the content is empty because all tokens went to reasoning)
+    reasoning = getattr(msg, "reasoning_content", None)
+    if reasoning and reasoning.strip():
+        print(f"[OpenAI] Using reasoning_content ({len(reasoning)} chars)", file=sys.stderr)
+        return reasoning
+
+    # Some proxies put reasoning in a different field
+    for attr in ["reasoning", "thinking", "thought"]:
+        val = getattr(msg, attr, None)
+        if val and val.strip():
+            print(f"[OpenAI] Using {attr} field ({len(val)} chars)", file=sys.stderr)
+            return val
+
+    return None
+
+
 async def fetch_fundamental_probabilities(
     match_title: str, home_team: str, away_team: str,
     league: str = "Unknown", match_date: str = "Unknown",
@@ -246,16 +279,21 @@ async def fetch_fundamental_probabilities(
         {"role": "user", "content": user_prompt},
     ]
 
-    # Try raw completion first (most compatible with Surplus)
+    # gpt-5.5 is a reasoning model — needs high max_tokens because
+    # reasoning_tokens consume from the same budget as completion_tokens.
+    # 500 tokens was all going to reasoning, leaving 0 for content.
+    # 4000 gives ~3000 for reasoning + 1000 for output.
+    MAX_TOKENS = 4000
+
     raw = None
     last_error = None
 
     for attempt, (mode_label, kwargs) in enumerate([
-        ("raw", {"temperature": 0.1, "max_tokens": 500}),
-        ("json_object", {"temperature": 0.1, "max_tokens": 500, "response_format": {"type": "json_object"}}),
+        ("raw", {"temperature": 0.1, "max_tokens": MAX_TOKENS}),
+        ("json_object", {"temperature": 0.1, "max_tokens": MAX_TOKENS, "response_format": {"type": "json_object"}}),
     ]):
         try:
-            print(f"[OpenAI] Attempt {attempt+1}: {mode_label} mode", file=sys.stderr)
+            print(f"[OpenAI] Attempt {attempt+1}: {mode_label} mode (max_tokens={MAX_TOKENS})", file=sys.stderr)
             response = await client.chat.completions.create(
                 model=SURPLUS_MODEL,
                 messages=messages,
@@ -270,11 +308,12 @@ async def fetch_fundamental_probabilities(
             if response.choices:
                 choice = response.choices[0]
                 print(f"  finish_reason: {choice.finish_reason}", file=sys.stderr)
-                print(f"  message.role: {choice.message.role if choice.message else 'NONE'}", file=sys.stderr)
-                print(f"  message.content length: {len(choice.message.content) if choice.message and choice.message.content else 0}", file=sys.stderr)
-                print(f"  message.content repr: {repr(choice.message.content) if choice.message else 'NONE'}", file=sys.stderr)
-                # Check for tool_calls or function_call (some models use these instead of content)
                 if choice.message:
+                    print(f"  message.role: {choice.message.role}", file=sys.stderr)
+                    print(f"  message.content length: {len(choice.message.content) if choice.message.content else 0}", file=sys.stderr)
+                    reasoning = getattr(choice.message, "reasoning_content", None)
+                    print(f"  message.reasoning_content length: {len(reasoning) if reasoning else 0}", file=sys.stderr)
+                    # Check for tool_calls or function_call
                     if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls:
                         print(f"  tool_calls: {choice.message.tool_calls}", file=sys.stderr)
                     if hasattr(choice.message, 'function_call') and choice.message.function_call:
@@ -282,18 +321,18 @@ async def fetch_fundamental_probabilities(
             else:
                 print(f"  WARNING: response.choices is EMPTY", file=sys.stderr)
 
-            raw = choice.message.content if response.choices and choice.message else None
+            # Extract content — handles reasoning models
+            raw = _extract_content_from_choice(choice) if response.choices else None
 
             if raw and raw.strip():
                 data = _extract_json_from_text(raw)
                 break
             else:
-                # Diagnose why it's empty
                 if response.choices:
                     finish = choice.finish_reason
                     if finish == "length":
-                        print(f"[OpenAI] {mode_label}: finish_reason=length — response truncated. Increase max_tokens.", file=sys.stderr)
-                        last_error = ValueError(f"{mode_label} mode: finish_reason=length (response truncated, increase max_tokens)")
+                        print(f"[OpenAI] {mode_label}: finish_reason=length — response truncated. Reasoning models need more tokens.", file=sys.stderr)
+                        last_error = ValueError(f"{mode_label} mode: finish_reason=length (reasoning model needs more tokens than {MAX_TOKENS})")
                     elif finish == "content_filter":
                         print(f"[OpenAI] {mode_label}: finish_reason=content_filter — prompt was blocked.", file=sys.stderr)
                         last_error = ValueError(f"{mode_label} mode: finish_reason=content_filter (prompt blocked by safety filter)")
@@ -317,14 +356,8 @@ async def fetch_fundamental_probabilities(
             traceback.print_exc(file=sys.stderr)
 
     if raw is None or (not raw or not raw.strip()):
-        # Check if model name might be wrong
-        model_hint = ""
-        if SURPLUS_MODEL == "gpt-5.5":
-            model_hint = " (model 'gpt-5.5' may not exist — try 'gpt-5.4' or 'gpt-4o')"
-        elif SURPLUS_MODEL == "gpt-5.4":
-            model_hint = " (model 'gpt-5.4' may not exist — try 'gpt-4o' or 'gpt-4-turbo')"
         raise ValueError(
-            f"All API modes returned empty. Model: {SURPLUS_MODEL}{model_hint}. "
+            f"All API modes returned empty. Model: {SURPLUS_MODEL}. "
             f"Check SURPLUS_API_KEY and that the model name is correct. "
             f"Last error: {last_error}"
         )
