@@ -170,10 +170,6 @@ def share_price_to_decimal_odds(price: float) -> float:
 # ── Data Compression ────────────────────────────────────────
 
 def compress_team_data(event: dict, team_idx: int) -> str:
-    """
-    Compress team stats into dense format: [W-D-L], [GF_Avg], [GA_Avg], [Injuries]
-    Falls back to placeholder if Gamma doesn't provide stats.
-    """
     teams = event.get("teams", [])
     if team_idx >= len(teams):
         return "N/A,N/A,N/A,N/A"
@@ -181,21 +177,16 @@ def compress_team_data(event: dict, team_idx: int) -> str:
     team = teams[team_idx]
     name = team.get("name", "Unknown")
 
-    # Try to extract from Gamma's nested data
-    # Gamma sometimes provides stats in team metadata
     stats = team.get("stats", {}) or {}
-
     wins = stats.get("wins", "?")
     draws = stats.get("draws", "?")
     losses = stats.get("losses", "?")
     gf = stats.get("goalsFor", stats.get("gf", "?"))
     ga = stats.get("goalsAgainst", stats.get("ga", "?"))
 
-    # Check for injuries in event metadata
     injuries = event.get("injuries", {}) or {}
     team_injuries = injuries.get(name, injuries.get(name.lower(), "None"))
 
-    # If no stats at all, use a minimal placeholder — the LLM will still work
     if wins == "?" and draws == "?" and losses == "?":
         return f"[?-?-?], [GF:{gf}], [GA:{ga}], [{team_injuries}]"
 
@@ -203,12 +194,10 @@ def compress_team_data(event: dict, team_idx: int) -> str:
 
 
 def compress_h2h(event: dict) -> str:
-    """Compress H2H data from event metadata."""
     h2h = event.get("headToHead", event.get("h2h", {})) or {}
     if not h2h:
         return "No data"
 
-    # Try common Gamma H2H formats
     last_score = h2h.get("lastScore", h2h.get("last_score", ""))
     if last_score:
         return str(last_score)
@@ -229,16 +218,36 @@ def get_openai_client() -> AsyncOpenAI:
 
 
 def _extract_json_from_text(text: str) -> dict:
-    """Robust JSON extraction from LLM output."""
+    """
+    Robust JSON extraction from LLM output.
+    Handles: markdown code blocks, prose, empty responses, non-JSON text.
+    """
+    if not text or not text.strip():
+        raise ValueError("LLM returned empty response — check API key and model name")
+
     cleaned = text.strip()
+
+    # Strip markdown code blocks
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', cleaned, re.DOTALL | re.IGNORECASE)
     if m:
         cleaned = m.group(1).strip()
+
+    # Find the outermost JSON object
     start = cleaned.find("{")
     end = cleaned.rfind("}")
-    if start >= 0 and end > start:
-        cleaned = cleaned[start:end+1]
-    return json.loads(cleaned)
+
+    if start < 0 or end <= start:
+        # No JSON found — show what we got
+        preview = cleaned[:300] if len(cleaned) > 300 else cleaned
+        raise ValueError(f"LLM response contains no JSON object. Raw: {preview}")
+
+    cleaned = cleaned[start:end+1]
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        preview = cleaned[:300] if len(cleaned) > 300 else cleaned
+        raise ValueError(f"Invalid JSON from LLM: {e}. Content: {preview}")
 
 
 async def fetch_fundamental_probabilities(
@@ -273,37 +282,60 @@ async def fetch_fundamental_probabilities(
 
     print(f"[OpenAI] Compressed prompt ({len(user_prompt)} chars): {user_prompt}", file=sys.stderr)
 
-    # Try json_object mode first
-    try:
-        response = await client.chat.completions.create(
-            model=SURPLUS_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.1,
-            max_tokens=500,
-            response_format={"type": "json_object"},
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # ── Try raw completion FIRST (no response_format) ──
+    # Many proxy endpoints silently reject json_object mode and return empty.
+    # Raw completion is the most compatible path.
+    raw = None
+    last_error = None
+
+    for attempt, (mode_label, kwargs) in enumerate([
+        # Attempt 1: raw completion (most compatible)
+        ("raw", {"temperature": 0.1, "max_tokens": 500}),
+        # Attempt 2: json_object mode (if supported)
+        ("json_object", {"temperature": 0.1, "max_tokens": 500, "response_format": {"type": "json_object"}}),
+    ]):
+        try:
+            print(f"[OpenAI] Attempt {attempt+1}: {mode_label} mode", file=sys.stderr)
+            response = await client.chat.completions.create(
+                model=SURPLUS_MODEL,
+                messages=messages,
+                **kwargs,
+            )
+            raw = response.choices[0].message.content
+            print(f"[OpenAI] {mode_label} response ({len(raw) if raw else 0} chars): {repr(raw)[:300]}", file=sys.stderr)
+
+            if raw and raw.strip():
+                data = _extract_json_from_text(raw)
+                break  # success — exit the loop
+            else:
+                print(f"[OpenAI] {mode_label} returned empty, trying next mode...", file=sys.stderr)
+                last_error = ValueError(f"{mode_label} mode returned empty response")
+        except ValueError as e:
+            # _extract_json_from_text failed — this is a content issue, not a mode issue
+            last_error = e
+            print(f"[OpenAI] {mode_label} parse failed: {e}", file=sys.stderr)
+            # Don't try next mode if we got content but it wasn't valid JSON
+            if raw and raw.strip():
+                break
+        except Exception as e:
+            last_error = e
+            print(f"[OpenAI] {mode_label} API call failed: {e}", file=sys.stderr)
+
+    if raw is None or (not raw or not raw.strip()):
+        raise ValueError(
+            f"All API modes returned empty. Model: {SURPLUS_MODEL}. "
+            f"Check SURPLUS_API_KEY and that the model name is correct. "
+            f"Last error: {last_error}"
         )
-        raw = response.choices[0].message.content
-        if not raw:
-            raise ValueError("empty response from LLM")
-        print(f"[OpenAI] Raw response ({len(raw)} chars): {raw}", file=sys.stderr)
-        data = _extract_json_from_text(raw)
-    except Exception as e:
-        print(f"[OpenAI] json_object mode failed ({e}), trying raw completion", file=sys.stderr)
-        response = await client.chat.completions.create(
-            model=SURPLUS_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.1,
-            max_tokens=500,
-        )
-        raw = response.choices[0].message.content or ""
-        print(f"[OpenAI] Raw fallback response ({len(raw)} chars): {raw}", file=sys.stderr)
-        data = _extract_json_from_text(raw)
+
+    if "data" not in dir():
+        # If we got content but couldn't parse it, last_error has the details
+        raise last_error or ValueError(f"Failed to parse LLM response: {raw[:200]}")
 
     # LLM outputs final probabilities — Python just validates
     home = float(data.get("home_win", 0.33))
@@ -359,10 +391,6 @@ def calculate_kelly_bet(
     kelly_fraction: float,
     threshold: float,
 ) -> Optional[dict]:
-    """
-    Kelly Criterion: f* = EV / (odds - 1)
-    Scaled by kelly_fraction, capped at 25% of bankroll.
-    """
     if ev < threshold or odds <= 1.0:
         return None
 
@@ -579,7 +607,6 @@ async def cmd_ev(ctx, *, args: str = ""):
                 color=discord.Color.blue(),
             )
 
-            # Probabilities (LLM output directly)
             prob_lines = [
                 f"🏠 **{probs.home_team}**: {probs.home_win*100:.1f}%",
                 f"🤝 **Draw**: {probs.draw*100:.1f}%",
@@ -587,10 +614,8 @@ async def cmd_ev(ctx, *, args: str = ""):
             ]
             embed.add_field(name="AI Fundamental Probabilities (Bivariate Poisson)", value="\n".join(prob_lines), inline=False)
 
-            # Justification
             embed.add_field(name="📐 Mathematical Justification", value=probs.justification, inline=False)
 
-            # CLOB Prices + EV + Kelly Stakes
             ev_lines = []
             kelly_lines = []
             positive_ev_outcomes = []
@@ -638,7 +663,6 @@ async def cmd_ev(ctx, *, args: str = ""):
 
             embed.add_field(name="AI Confidence", value=f"{probs.confidence*100:.0f}%", inline=True)
 
-            # Summary
             if positive_ev_outcomes:
                 total_stake = sum(
                     calculate_kelly_bet(
