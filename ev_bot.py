@@ -3,7 +3,7 @@ ev_bot.py — EV-Based Polymarket Betting Bot (Kelly Criterion Mode)
 ======================================================================
 Architecture:
   1. Gamma API      → fetch market data + clobTokenIds
-  2. OpenAI (gpt-5.4) → compressed prompt, bivariate Poisson, outputs final probs
+  2. OpenAI (gpt-5.4) → fundamental probabilities (no market data)
   3. CLOB API       → live best-ask prices → decimal odds
   4. EV Math        → deterministic EV = (prob * odds) - 1
   5. Kelly Staking  → f* = EV / (odds - 1), scaled by kelly fraction
@@ -50,29 +50,45 @@ class MatchProbabilities(BaseModel):
     justification: str = Field(...)
     confidence: float = Field(..., ge=0.0, le=1.0)
 
-# ── Compressed Prompts ──────────────────────────────────────
+# ── Prompts (verbose format — known to work with Surplus) ──
 
 SYSTEM_PROMPT = (
-    "Role: Deterministic Quant Sports Analyst.\n"
-    "Task: Calculate true win/draw/loss probability for football.\n"
-    "Rules:\n"
-    "1. Use purely fundamental data (form, xG, H2H, injuries, venue).\n"
-    "2. IGNORE ALL MARKET ODDS AND CONSENSUS.\n"
-    "3. Run bivariate Poisson distribution internally based on derived expected goals (xG). "
-    "Home venue = +0.20 xG, Away = -0.20 xG.\n"
-    "4. OUTPUT FORMAT STRICT: Output ONLY the final % for Home/Draw/Away, followed by a "
-    "maximum 2-sentence mathematical justification. No conversational filler. No step-by-step math.\n\n"
-    "Output exactly this JSON and nothing else:\n"
-    '{"home_win":0.XX,"draw":0.XX,"away_win":0.XX,"justification":"<2 sentences max>"}\n'
-    "Probabilities MUST sum to 1.0."
+    "You are a football probability engine. "
+    "Calculate fundamental probabilities based ONLY on football team fundamentals: "
+    "Expected Goals (xG), fixture congestion, squad depth, tactical matchups, "
+    "injuries, manager quality, home/away form, rest days, and head-to-head history. "
+    "You must COMPLETELY IGNORE market consensus, betting volume, current odds, "
+    "or any market-derived data. Calculate without market consensus completely.\n\n"
+    "Run a bivariate Poisson distribution internally based on derived expected goals (xG). "
+    "Home venue = +0.20 xG, Away = -0.20 xG.\n\n"
+    "Output ONLY a valid JSON object with these fields:\n"
+    "{\n"
+    '  "home_win": <float 0-1>,\n'
+    '  "draw": <float 0-1>,\n'
+    '  "away_win": <float 0-1>,\n'
+    '  "justification": "<max 2 sentences explaining the math>"\n'
+    "}\n"
+    "home_win + draw + away_win MUST sum exactly to 1.0. "
+    "Do NOT include any text before or after the JSON. "
+    "Do NOT wrap in markdown code blocks. Output raw JSON only."
 )
 
 USER_PROMPT_TEMPLATE = (
-    "[{league}] | Home: {home_team} | Away: {away_team}\n"
-    "H_Data: {home_data}\n"
-    "A_Data: {away_data}\n"
-    "H2H_Venue: {h2h}\n"
-    "Output probabilities."
+    'Analyze this football match: "{match_title}"\n'
+    "Home team: {home_team}\n"
+    "Away team: {away_team}\n"
+    "League/Competition: {league}\n"
+    "Match date: {match_date}\n\n"
+    "Consider these fundamental factors:\n"
+    "- Recent form (last 6-10 matches) and xG trends\n"
+    "- Head-to-head record (venue-adjusted)\n"
+    "- Injuries, suspensions, and squad availability\n"
+    "- Fixture congestion and rest days\n"
+    "- Tactical matchup and manager quality\n"
+    "- Home/away performance splits\n\n"
+    "IMPORTANT: Base your analysis ONLY on football fundamentals. "
+    "IGNORE all market data, betting odds, and trading volume. "
+    "Output ONLY the raw JSON object — no markdown, no explanation."
 )
 
 # ── Gamma API ───────────────────────────────────────────────
@@ -167,48 +183,6 @@ def share_price_to_decimal_odds(price: float) -> float:
     return 1.0 / price
 
 
-# ── Data Compression ────────────────────────────────────────
-
-def compress_team_data(event: dict, team_idx: int) -> str:
-    teams = event.get("teams", [])
-    if team_idx >= len(teams):
-        return "N/A,N/A,N/A,N/A"
-
-    team = teams[team_idx]
-    name = team.get("name", "Unknown")
-
-    stats = team.get("stats", {}) or {}
-    wins = stats.get("wins", "?")
-    draws = stats.get("draws", "?")
-    losses = stats.get("losses", "?")
-    gf = stats.get("goalsFor", stats.get("gf", "?"))
-    ga = stats.get("goalsAgainst", stats.get("ga", "?"))
-
-    injuries = event.get("injuries", {}) or {}
-    team_injuries = injuries.get(name, injuries.get(name.lower(), "None"))
-
-    if wins == "?" and draws == "?" and losses == "?":
-        return f"[?-?-?], [GF:{gf}], [GA:{ga}], [{team_injuries}]"
-
-    return f"[{wins}-{draws}-{losses}], [GF:{gf}], [GA:{ga}], [{team_injuries}]"
-
-
-def compress_h2h(event: dict) -> str:
-    h2h = event.get("headToHead", event.get("h2h", {})) or {}
-    if not h2h:
-        return "No data"
-
-    last_score = h2h.get("lastScore", h2h.get("last_score", ""))
-    if last_score:
-        return str(last_score)
-
-    last_matches = h2h.get("lastMatches", h2h.get("last_matches", []))
-    if last_matches and len(last_matches) > 0:
-        return str(last_matches[0])
-
-    return "No data"
-
-
 # ── OpenAI Probability Engine ───────────────────────────────
 
 def get_openai_client() -> AsyncOpenAI:
@@ -218,12 +192,9 @@ def get_openai_client() -> AsyncOpenAI:
 
 
 def _extract_json_from_text(text: str) -> dict:
-    """
-    Robust JSON extraction from LLM output.
-    Handles: markdown code blocks, prose, empty responses, non-JSON text.
-    """
+    """Robust JSON extraction from LLM output."""
     if not text or not text.strip():
-        raise ValueError("LLM returned empty response — check API key and model name")
+        raise ValueError("LLM returned empty response")
 
     cleaned = text.strip()
 
@@ -237,7 +208,6 @@ def _extract_json_from_text(text: str) -> dict:
     end = cleaned.rfind("}")
 
     if start < 0 or end <= start:
-        # No JSON found — show what we got
         preview = cleaned[:300] if len(cleaned) > 300 else cleaned
         raise ValueError(f"LLM response contains no JSON object. Raw: {preview}")
 
@@ -261,42 +231,27 @@ async def fetch_fundamental_probabilities(
     """
     client = get_openai_client()
 
-    # Compress team data
-    if event:
-        home_data = compress_team_data(event, 0)
-        away_data = compress_team_data(event, 1)
-        h2h = compress_h2h(event)
-    else:
-        home_data = "N/A,N/A,N/A,N/A"
-        away_data = "N/A,N/A,N/A,N/A"
-        h2h = "No data"
-
     user_prompt = USER_PROMPT_TEMPLATE.format(
-        league=league,
+        match_title=match_title,
         home_team=home_team,
         away_team=away_team,
-        home_data=home_data,
-        away_data=away_data,
-        h2h=h2h,
+        league=league,
+        match_date=match_date,
     )
 
-    print(f"[OpenAI] Compressed prompt ({len(user_prompt)} chars): {user_prompt}", file=sys.stderr)
+    print(f"[OpenAI] Prompt ({len(user_prompt)} chars)", file=sys.stderr)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
 
-    # ── Try raw completion FIRST (no response_format) ──
-    # Many proxy endpoints silently reject json_object mode and return empty.
-    # Raw completion is the most compatible path.
+    # Try raw completion first (most compatible with Surplus)
     raw = None
     last_error = None
 
     for attempt, (mode_label, kwargs) in enumerate([
-        # Attempt 1: raw completion (most compatible)
         ("raw", {"temperature": 0.1, "max_tokens": 500}),
-        # Attempt 2: json_object mode (if supported)
         ("json_object", {"temperature": 0.1, "max_tokens": 500, "response_format": {"type": "json_object"}}),
     ]):
         try:
@@ -311,15 +266,13 @@ async def fetch_fundamental_probabilities(
 
             if raw and raw.strip():
                 data = _extract_json_from_text(raw)
-                break  # success — exit the loop
+                break
             else:
                 print(f"[OpenAI] {mode_label} returned empty, trying next mode...", file=sys.stderr)
                 last_error = ValueError(f"{mode_label} mode returned empty response")
         except ValueError as e:
-            # _extract_json_from_text failed — this is a content issue, not a mode issue
             last_error = e
             print(f"[OpenAI] {mode_label} parse failed: {e}", file=sys.stderr)
-            # Don't try next mode if we got content but it wasn't valid JSON
             if raw and raw.strip():
                 break
         except Exception as e:
@@ -334,7 +287,6 @@ async def fetch_fundamental_probabilities(
         )
 
     if "data" not in dir():
-        # If we got content but couldn't parse it, last_error has the details
         raise last_error or ValueError(f"Failed to parse LLM response: {raw[:200]}")
 
     # LLM outputs final probabilities — Python just validates
