@@ -157,15 +157,27 @@ def fetch_event_from_gamma(slug: str) -> Optional[dict]:
     return None
 
 
-def _team_match(name: str, question: str) -> bool:
-    """True if team name appears in question (case-insensitive substring)."""
-    if not name or not question:
-        return False
-    return name.lower() in question.lower()
+def _parse_teams_from_title(title: str) -> tuple:
+    """
+    Parse away/home team names from event title.
+    Polymarket MLB titles: "cleveland guardians vs. tampa bay rays"
+    Returns: (away_name_lower, home_name_lower)
+    """
+    t = title.lower().strip()
+    for sep in [" vs. ", " vs ", " @ "]:
+        if sep in t:
+            parts = t.split(sep, 1)
+            return parts[0].strip(), parts[1].strip()
+    return "", ""
 
 
-def _question_is_moneyline(question: str) -> bool:
-    """True if question is a moneyline market — not spread/O/U/prop."""
+def _word_in_text(word: str, text: str) -> bool:
+    """Check if word appears as a case-insensitive substring."""
+    return word.lower() in text.lower() if word and text else False
+
+
+def _is_moneyline_question(question: str) -> bool:
+    """A moneyline question is one that DOESN'T contain spread/O/U/prop keywords."""
     q = question.lower()
     skip = ["spread:", "o/u", "over/under", "innings", "extra innings",
             "1st 5", "strikeout", "home run", "hits", "runs", "total bases"]
@@ -173,47 +185,30 @@ def _question_is_moneyline(question: str) -> bool:
 
 
 def extract_mlb_markets_from_event(event: dict) -> list[dict]:
+    """
+    Extract moneyline markets from an MLB Polymarket event.
+
+    Strategy: parse team names from the title, then for each market question,
+    check which team it exclusively mentions. A moneyline market mentions exactly
+    one team (e.g. "Cleveland Guardians" or "Tampa Bay Rays").
+    """
     markets = event.get("markets", [])
-    teams = event.get("teams", [])
-
-    # Build clean team objects — use full name, short name, abbreviation
-    away_team_obj = teams[0] if len(teams) >= 1 else {"name": ""}
-    home_team_obj = teams[1] if len(teams) >= 2 else {"name": ""}
-
-    away_full = (away_team_obj.get("name") or "").lower().strip()
-    home_full = (home_team_obj.get("name") or "").lower().strip()
-    away_short = (away_team_obj.get("shortName") or away_team_obj.get("abbreviation") or "").lower().strip()
-    home_short = (home_team_obj.get("shortName") or home_team_obj.get("abbreviation") or "").lower().strip()
-
-    # Names to check per team (full + abbreviation/shortName)
-    away_names = [n for n in [away_full, away_short] if n]
-    home_names = [n for n in [home_full, home_short] if n]
-
     title = (event.get("title") or "").lower()
 
-    # Parse title teams as fallback
-    title_away = title_home = ""
-    if " vs " in title:
-        parts = [p.strip() for p in title.split(" vs ")]
-        if len(parts) >= 2:
-            title_away, title_home = parts[0], parts[1]
-    elif " @ " in title:
-        parts = [p.strip() for p in title.split(" @ ")]
-        if len(parts) >= 2:
-            title_away, title_home = parts[0], parts[1]
+    away_name, home_name = _parse_teams_from_title(title)
 
-    # ── DEBUG: dump all info ──
-    print(f"[MLB Markets] Event title: '{title}'", file=sys.stderr)
-    print(f"[MLB Markets] Away: full='{away_full}' short='{away_short}' | Home: full='{home_full}' short='{home_short}'", file=sys.stderr)
-    print(f"[MLB Markets] Title teams: away='{title_away}', home='{title_home}'", file=sys.stderr)
-    print(f"[MLB Markets] Away search names: {away_names}", file=sys.stderr)
-    print(f"[MLB Markets] Home search names: {home_names}", file=sys.stderr)
-    print(f"[MLB Markets] ===== ALL {len(markets)} MARKETS (pre-filter) =====", file=sys.stderr)
+    # Debug: dump everything
+    print(f"[MLB Markets] Title: '{title}'", file=sys.stderr)
+    print(f"[MLB Markets] Parsed: away='{away_name}' home='{home_name}'", file=sys.stderr)
+    print(f"[MLB Markets] ===== ALL {len(markets)} MARKETS =====", file=sys.stderr)
     for i, m in enumerate(markets):
         q = m.get("question", "NO_QUESTION")
-        print(f"[MLB Markets]   [{i}] '{q}'", file=sys.stderr)
+        cids = m.get("clobTokenIds", "[]")
+        print(f"[MLB Markets]   [{i}] q='{q}' cids={cids}", file=sys.stderr)
 
     result = []
+    found_away = None
+    found_home = None
 
     for i, m in enumerate(markets):
         question_raw = m.get("question", "")
@@ -221,55 +216,48 @@ def extract_mlb_markets_from_event(event: dict) -> list[dict]:
         if not question:
             continue
 
+        # Get clobTokenIds
         clob_ids = m.get("clobTokenIds", "[]")
         if isinstance(clob_ids, str):
             try:
                 clob_ids = json.loads(clob_ids)
             except (json.JSONDecodeError, TypeError):
                 clob_ids = []
-        if not clob_ids or len(clob_ids) == 0:
-            print(f"[MLB Markets]   [{i}] SKIP (no clobTokenIds)", file=sys.stderr)
+        if not clob_ids:
             continue
 
-        # Filter: moneyline only
-        if not _question_is_moneyline(question):
-            print(f"[MLB Markets]   [{i}] SKIP (non-moneyline): '{question_raw[:80]}'", file=sys.stderr)
+        # Must be moneyline (not spread/O/U/prop)
+        if not _is_moneyline_question(question):
+            print(f"[MLB Markets]   [{i}] SKIP (non-moneyline)", file=sys.stderr)
             continue
 
         token_id = clob_ids[0]
 
-        # Determine: away or home?
-        away_match = any(_team_match(n, question) for n in away_names)
-        home_match = any(_team_match(n, question) for n in home_names)
+        # Check: does this question mention away team but NOT home team?
+        mentions_away = away_name and _word_in_text(away_name, question)
+        mentions_home = home_name and _word_in_text(home_name, question)
 
-        if away_match and not home_match:
-            market_type = "away"
-        elif home_match and not away_match:
-            market_type = "home"
-        elif away_match and home_match:
-            # Both match — pick the one appearing first
-            away_pos = min((question.find(n) for n in away_names if n in question), default=999)
-            home_pos = min((question.find(n) for n in home_names if n in question), default=999)
-            market_type = "away" if away_pos < home_pos else "home"
-        elif title_away and any(_team_match(n, question) for n in [title_away]):
-            market_type = "away"
-        elif title_home and any(_team_match(n, question) for n in [title_home]):
-            market_type = "home"
+        if mentions_away and not mentions_home:
+            if found_away is None:
+                found_away = {"type": "away", "token_id": token_id, "question": question_raw}
+                print(f"[MLB Markets]   [{i}] -> AWAY moneyline", file=sys.stderr)
+            else:
+                print(f"[MLB Markets]   [{i}] -> AWAY (duplicate, skipped)", file=sys.stderr)
+        elif mentions_home and not mentions_away:
+            if found_home is None:
+                found_home = {"type": "home", "token_id": token_id, "question": question_raw}
+                print(f"[MLB Markets]   [{i}] -> HOME moneyline", file=sys.stderr)
+            else:
+                print(f"[MLB Markets]   [{i}] -> HOME (duplicate, skipped)", file=sys.stderr)
         else:
-            print(f"[MLB Markets]   [{i}] UNMATCHED: '{question_raw[:80]}'", file=sys.stderr)
-            continue
+            print(f"[MLB Markets]   [{i}] UNMATCHED (away={mentions_away} home={mentions_home})", file=sys.stderr)
 
-        result.append({
-            "type": market_type,
-            "token_id": token_id,
-            "question": question_raw,
-            "slug": m.get("slug", ""),
-        })
-        print(f"[MLB Markets]   [{i}] MATCHED: type={market_type} '{question_raw[:80]}'", file=sys.stderr)
+    if found_away:
+        result.append(found_away)
+    if found_home:
+        result.append(found_home)
 
-    away_count = sum(1 for r in result if r['type'] == 'away')
-    home_count = sum(1 for r in result if r['type'] == 'home')
-    print(f"[MLB Markets] Total matched: {len(result)} (away={away_count}, home={home_count})", file=sys.stderr)
+    print(f"[MLB Markets] Total: {len(result)} (away={'yes' if found_away else 'NO'}, home={'yes' if found_home else 'NO'})", file=sys.stderr)
     return result
 
 
