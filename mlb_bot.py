@@ -36,6 +36,7 @@ DEFAULT_BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
 
 class PitcherData(BaseModel):
     name: str = Field(default="Unknown")
+    handedness: str = Field(default="R")
     xfip: Optional[float] = Field(default=None)
     siera: Optional[float] = Field(default=None)
     k_bb_pct: Optional[float] = Field(default=None)
@@ -77,17 +78,27 @@ class SabermetricOutput(BaseModel):
 
 SYSTEM_PROMPT = (
     "**Role & Objective**\n"
-    "You are the sabermetric analysis module of an automated sports prediction framework. "
-    "Your strict, singular function is to evaluate MLB matchups and output fundamental, "
-    "mathematically isolated baseball variables for downstream processing.\n\n"
-    "**Execution Constraints**\n"
-    "1. **No Final Probabilities:** You must never calculate, synthesize, or output a "
-    "final true win probability, run line prediction, or moneyline suggestion.\n"
-    "2. **Backend Handoff:** Your output serves strictly as the raw structural data feed. "
-    "All final deterministic probability calculations, risk-management parameters, and "
-    "execution decisions are handled exclusively by the backend machine code.\n"
-    "3. **No Market Consensus:** Completely ignore and exclude all market consensus data, "
-    "betting odds, public betting percentages, and trading volumes.\n\n"
+    "You are the sabermetric data extraction module of an automated MLB prediction framework. "
+    "Your primary role is to fetch, parse, and verify real-time game conditions, starting pitchers, "
+    "and stadium factors for a given matchup.\n\n"
+    "**CRITICAL DATA FETCHING RULES**\n\n"
+    "1. **VENUE INFERENCE (Never Output 'Unknown'):**\n"
+    "   - The venue is ALWAYS the home team's official ballpark unless explicitly designated "
+    "as an international/neutral site game.\n"
+    "   - You MUST automatically fill the venue based on the home team (e.g., Phillies = "
+    "Citizens Bank Park, Giants = Oracle Park, Yankees = Yankee Stadium, Dodgers = "
+    "Dodger Stadium).\n\n"
+    "2. **MANDATORY STARTING PITCHER LOOKUP (Never Output 'TBD' without searching):**\n"
+    "   - You MUST search live MLB schedules/probable pitcher sources (MLB.com, ESPN, "
+    "Rotowire) for the specified game date to identify the announced starting pitchers.\n"
+    "   - If a pitcher is unannounced 2 hours before game time, search for the scheduled "
+    "bullpen game opener or rotation turn. Only return TBD if no official announcement "
+    "exists across MLB sources.\n\n"
+    "3. **EXCLUSIONS & HANDOFF:**\n"
+    "   - Output ONLY raw fundamental variables (pitcher xFIP/SIERA, venue factors, "
+    "bullpen fatigue, offense wRC+).\n"
+    "   - NEVER calculate a final win probability, run line, or moneyline.\n"
+    "   - EXCLUDE all betting odds, market consensus, and line movements.\n\n"
     "**Fundamental Data Parameters**\n"
     "- **Starting Pitching:** Focus exclusively on predictive baselines such as xFIP, SIERA, "
     "K-BB%, and platoon/handedness splits. Ignore traditional ERA.\n"
@@ -102,41 +113,41 @@ SYSTEM_PROMPT = (
     '  "away_team": "<string>",\n'
     '  "home_team": "<string>",\n'
     '  "match_name": "<string>",\n'
-    '  "away_pitcher": {"name": "<string>", "xfip": <float>, "siera": <float>, "k_bb_pct": <float>, "vs_lhb": <float>, "vs_rhb": <float>},\n'
-    '  "home_pitcher": {"name": "<string>", "xfip": <float>, "siera": <float>, "k_bb_pct": <float>, "vs_lhb": <float>, "vs_rhb": <float>},\n'
-    '  "away_offense": {"wrc_plus": <float>, "iso": <float>, "ops": <float>},\n'
-    '  "home_offense": {"wrc_plus": <float>, "iso": <float>, "ops": <float>},\n'
-    '  "away_bullpen": {"rested_key_relievers": <int 0-5>, "aggregate_xfip": <float>, "fatigue_flag": "<fresh|moderate|taxed>"},\n'
-    '  "home_bullpen": {"rested_key_relievers": <int 0-5>, "aggregate_xfip": <float>, "fatigue_flag": "<fresh|moderate|taxed>"},\n'
-    '  "venue": {"park_factor": <float>, "hr_factor": <float>, "wind_speed_mph": <float>, "wind_direction": "<string>", "temp_f": <float>, "stadium_name": "<string>"},\n'
+    '  "away_pitcher": {"name": "<string>", "handedness": "<L|R>", "xfip": <float|null>, "siera": <float|null>, "k_bb_pct": <float|null>, "vs_lhb": <float|null>, "vs_rhb": <float|null>},\n'
+    '  "home_pitcher": {"name": "<string>", "handedness": "<L|R>", "xfip": <float|null>, "siera": <float|null>, "k_bb_pct": <float|null>, "vs_lhb": <float|null>, "vs_rhb": <float|null>},\n'
+    '  "away_offense": {"wrc_plus": <float|null>, "iso": <float|null>, "ops": <float|null>},\n'
+    '  "home_offense": {"wrc_plus": <float|null>, "iso": <float|null>, "ops": <float|null>},\n'
+    '  "away_bullpen": {"rested_key_relievers": <int 0-5|null>, "aggregate_xfip": <float|null>, "fatigue_flag": "<fresh|moderate|taxed|null>"},\n'
+    '  "home_bullpen": {"rested_key_relievers": <int 0-5|null>, "aggregate_xfip": <float|null>, "fatigue_flag": "<fresh|moderate|taxed|null>"},\n'
+    '  "venue": {"park_factor": <float|null>, "hr_factor": <float|null>, "wind_speed_mph": <float|null>, "wind_direction": "<string|null>", "temp_f": <float|null>, "stadium_name": "<string>"},\n'
     '  "confidence": <float 0-1>\n'
     "}\n\n"
     "**REMINDER:** Output ONLY the raw JSON. No markdown code blocks. No text before or after. "
     "Do NOT include a 'home_win', 'draw', or 'away_win' field — those are calculated downstream. "
-    "Use null for any numeric field you cannot determine (do not guess zero)."
+    "Use null for any numeric field you cannot determine after exhaustive search (do not guess zero)."
 )
 
 USER_PROMPT_TEMPLATE = (
-    "**Task:** Extract and isolate the fundamental sabermetric inputs for the following "
-    "MLB matchup. Format the data structurally so it can be ingested by the backend "
-    "calculation engine.\n\n"
-    "**Matchup Details:**\n"
+    "**Task:** Identify the starting pitchers, map the venue, and extract fundamental "
+    "sabermetric inputs for today's MLB matchup.\n\n"
+    "**Match Details:**\n"
     "- **Away Team:** {away_team}\n"
     "- **Home Team:** {home_team}\n"
-    "- **Date:** {match_date}\n"
-    "- **Venue:** {stadium_name}\n"
-    "- **Starting Pitchers:** {away_pitcher} vs. {home_pitcher}\n\n"
-    "**Required Outputs:**\n"
-    "1. **Starting Pitcher Baselines:** Provide recent xFIP, SIERA, K-BB%, and performance "
-    "splits against left-handed/right-handed batters for both starters.\n"
-    "2. **Offensive Efficiency:** List both teams' wRC+ and ISO over the last 14 days "
-    "specifically against the respective starter's throwing arm (LHP vs RHP).\n"
-    "3. **Bullpen Availability:** Detail the usage rates and rest days for the top three "
-    "high-leverage relievers on both rosters over the last 72 hours.\n"
-    "4. **Venue/Environmental Modifiers:** Identify the specific stadium run factors and "
-    "current weather conditions (wind speed/direction, temperature) affecting ball flight today.\n\n"
-    "**System Reminder:** Output only the isolated fundamental variables requested. "
-    "Do not attempt to calculate a winner or generate a definitive probability output. "
+    "- **Date:** {match_date}\n\n"
+    "**Execution Instructions:**\n"
+    "1. **Step 1 (Venue):** Resolve `{home_team}` to its official home ballpark name.\n"
+    "2. **Step 2 (Probable Pitchers Search):** Perform a live query for "
+    "\"MLB probable pitchers {match_date} {away_team} vs {home_team}\" to retrieve "
+    "the confirmed or projected starters for both teams.\n"
+    "3. **Step 3 (Sabermetrics Extraction):** Gather recent xFIP, K-BB%, SIERA, and "
+    "handedness splits for both confirmed starters.\n\n"
+    "**Required Structural Output:**\n"
+    "- **Venue:** [Official Stadium Name]\n"
+    "- **Starting Pitchers:** [Away Pitcher Name] ([L/R]) vs. [Home Pitcher Name] ([L/R])\n"
+    "- **Starter Metrics:** [xFIP / K-BB% / Platoon Splits for both pitchers]\n"
+    "- **Bullpen Rest Index:** [High-leverage usage past 72h]\n"
+    "- **Park Factor Modifiers:** [Run/HR park factors for resolved stadium]\n\n"
+    "DO NOT output \"TBD\" or \"Unknown\" without completing the live search step first.\n"
     "Output ONLY the raw JSON object — no markdown, no explanation."
 )
 
@@ -230,46 +241,6 @@ def extract_mlb_markets_from_event(event: dict) -> list[dict]:
     return result
 
 
-def extract_pitchers_from_event(event: dict) -> tuple:
-    away_pitcher = "TBD"
-    home_pitcher = "TBD"
-    for key in ["awayPitcher", "away_pitcher", "pitcherAway"]:
-        val = event.get(key) or (event.get("metadata") or {}).get(key)
-        if val and isinstance(val, str) and val.strip():
-            away_pitcher = val.strip()
-            break
-    for key in ["homePitcher", "home_pitcher", "pitcherHome"]:
-        val = event.get(key) or (event.get("metadata") or {}).get(key)
-        if val and isinstance(val, str) and val.strip():
-            home_pitcher = val.strip()
-            break
-    return away_pitcher, home_pitcher
-
-
-def extract_stadium_from_event(event: dict) -> str:
-    for key in ["venue", "stadium", "location"]:
-        val = event.get(key)
-        if isinstance(val, dict):
-            for name_key in ["name", "stadium", "venue"]:
-                n = val.get(name_key)
-                if n and isinstance(n, str) and n.strip():
-                    return n.strip()
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    meta = event.get("metadata") or event.get("meta") or {}
-    if isinstance(meta, dict):
-        for key in ["venue", "stadium", "location", "ballpark"]:
-            val = meta.get(key)
-            if isinstance(val, dict):
-                for name_key in ["name", "stadium"]:
-                    n = val.get(name_key)
-                    if n and isinstance(n, str) and n.strip():
-                        return n.strip()
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-    return "Unknown"
-
-
 def parse_polymarket_url(url: str) -> Optional[str]:
     m = re.search(
         r'https?://polymarket\.com/(?:event|sports/[a-z0-9]+)/([a-z0-9][a-z0-9\-]+[a-z0-9])',
@@ -345,14 +316,12 @@ def _extract_content_from_choice(choice) -> Optional[str]:
 
 async def fetch_sabermetric_variables(
     match_title: str, away_team: str, home_team: str,
-    match_date: str = "Unknown", stadium_name: str = "Unknown",
-    away_pitcher: str = "TBD", home_pitcher: str = "TBD",
+    match_date: str = "Unknown",
 ) -> SabermetricOutput:
     client = get_openai_client()
     user_prompt = USER_PROMPT_TEMPLATE.format(
         away_team=away_team, home_team=home_team,
-        match_date=match_date, stadium_name=stadium_name,
-        away_pitcher=away_pitcher, home_pitcher=home_pitcher,
+        match_date=match_date,
     )
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -396,13 +365,13 @@ async def fetch_sabermetric_variables(
         away_team=str(data.get("away_team", away_team)),
         home_team=str(data.get("home_team", home_team)),
         match_name=str(data.get("match_name", match_title)),
-        away_pitcher=PitcherData(**data.get("away_pitcher", {})) if isinstance(data.get("away_pitcher"), dict) else PitcherData(name=away_pitcher),
-        home_pitcher=PitcherData(**data.get("home_pitcher", {})) if isinstance(data.get("home_pitcher"), dict) else PitcherData(name=home_pitcher),
+        away_pitcher=PitcherData(**data.get("away_pitcher", {})) if isinstance(data.get("away_pitcher"), dict) else PitcherData(),
+        home_pitcher=PitcherData(**data.get("home_pitcher", {})) if isinstance(data.get("home_pitcher"), dict) else PitcherData(),
         away_offense=OffenseData(**data.get("away_offense", {})) if isinstance(data.get("away_offense"), dict) else OffenseData(),
         home_offense=OffenseData(**data.get("home_offense", {})) if isinstance(data.get("home_offense"), dict) else OffenseData(),
         away_bullpen=BullpenData(**data.get("away_bullpen", {})) if isinstance(data.get("away_bullpen"), dict) else BullpenData(),
         home_bullpen=BullpenData(**data.get("home_bullpen", {})) if isinstance(data.get("home_bullpen"), dict) else BullpenData(),
-        venue=VenueData(**data.get("venue", {})) if isinstance(data.get("venue"), dict) else VenueData(stadium_name=stadium_name),
+        venue=VenueData(**data.get("venue", {})) if isinstance(data.get("venue"), dict) else VenueData(),
         confidence=float(data.get("confidence", 0.5)),
     )
 
@@ -601,7 +570,6 @@ async def cmd_mlb(ctx, *, args: str = ""):
 
             title = event.get("title", slug)
 
-            # Get team names from the moneyline market outcomes
             markets = extract_mlb_markets_from_event(event)
 
             if len(markets) < 2:
@@ -630,8 +598,6 @@ async def cmd_mlb(ctx, *, args: str = ""):
             series = event.get("series", [])
             league = series[0].get("title", "MLB") if isinstance(series, list) and series else "MLB"
             match_date = event.get("startDate") or event.get("scheduledStart") or "Unknown"
-            away_pitcher, home_pitcher = extract_pitchers_from_event(event)
-            stadium_name = extract_stadium_from_event(event)
 
             clob_prices = {}
             for outcome_type in ["away", "home"]:
@@ -643,8 +609,7 @@ async def cmd_mlb(ctx, *, args: str = ""):
             try:
                 sm = await fetch_sabermetric_variables(
                     match_title=title, away_team=away_team, home_team=home_team,
-                    match_date=str(match_date), stadium_name=stadium_name,
-                    away_pitcher=away_pitcher, home_pitcher=home_pitcher,
+                    match_date=str(match_date),
                 )
             except Exception as e:
                 await ctx.send(f"❌ **Sabermetric Engine Error**: {type(e).__name__}: {e}")
@@ -667,17 +632,19 @@ async def cmd_mlb(ctx, *, args: str = ""):
             )
 
             pitcher_lines = []
+            p1_name = f"{sm.away_pitcher.name} ({sm.away_pitcher.handedness})" if sm.away_pitcher.handedness else sm.away_pitcher.name
+            p2_name = f"{sm.home_pitcher.name} ({sm.home_pitcher.handedness})" if sm.home_pitcher.handedness else sm.home_pitcher.name
             if sm.away_pitcher.xfip and sm.home_pitcher.xfip:
-                p1 = f"**{sm.away_pitcher.name}** (AWAY): xFIP {sm.away_pitcher.xfip:.2f}"
+                p1 = f"**{p1_name}** (AWAY): xFIP {sm.away_pitcher.xfip:.2f}"
                 if sm.away_pitcher.siera: p1 += f" | SIERA {sm.away_pitcher.siera:.2f}"
                 if sm.away_pitcher.k_bb_pct: p1 += f" | K-BB% {sm.away_pitcher.k_bb_pct:.1f}%"
                 pitcher_lines.append(p1)
-                p2 = f"**{sm.home_pitcher.name}** (HOME): xFIP {sm.home_pitcher.xfip:.2f}"
+                p2 = f"**{p2_name}** (HOME): xFIP {sm.home_pitcher.xfip:.2f}"
                 if sm.home_pitcher.siera: p2 += f" | SIERA {sm.home_pitcher.siera:.2f}"
                 if sm.home_pitcher.k_bb_pct: p2 += f" | K-BB% {sm.home_pitcher.k_bb_pct:.1f}%"
                 pitcher_lines.append(p2)
             else:
-                pitcher_lines.append(f"{sm.away_pitcher.name} vs {sm.home_pitcher.name}")
+                pitcher_lines.append(f"{p1_name} vs {p2_name}")
             embed.add_field(name="🎯 Starting Pitchers", value="\n".join(pitcher_lines), inline=False)
 
             offense_lines = []
