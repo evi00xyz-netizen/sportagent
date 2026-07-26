@@ -53,14 +53,16 @@ class MatchProbabilities(BaseModel):
 # ── Prompts ─────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "You are a football probability engine. "
-    "Calculate fundamental probabilities based ONLY on football team fundamentals: "
-    "Expected Goals (xG), fixture congestion, squad depth, tactical matchups, "
-    "injuries, manager quality, home/away form, rest days, and head-to-head history. "
-    "You must COMPLETELY IGNORE market consensus, betting volume, current odds, "
-    "or any market-derived data. Calculate without market consensus completely.\n\n"
-    "Run a bivariate Poisson distribution internally based on derived expected goals (xG). "
-    "Home venue = +0.20 xG, Away = -0.20 xG.\n\n"
+    "Role: Deterministic Quant Sports Analyst.\n"
+    "Task: Calculate true win/draw/loss probability for football.\n"
+    "Rules:\n"
+    "1. Use purely fundamental data (form, xG, H2H, injuries, venue).\n"
+    "2. IGNORE ALL MARKET ODDS AND CONSENSUS.\n"
+    "3. Run bivariate Poisson distribution internally based on derived expected goals (xG). "
+    "Home venue = +0.20 xG, Away = -0.20 xG.\n"
+    "4. OUTPUT FORMAT STRICT: Output ONLY the final % for Home/Draw/Away, "
+    "followed by a maximum 2-sentence mathematical justification. "
+    "No conversational filler. No step-by-step math.\n\n"
     "Output ONLY a valid JSON object with these fields:\n"
     "{\n"
     '  "home_win": <float 0-1>,\n'
@@ -73,23 +75,22 @@ SYSTEM_PROMPT = (
     "Do NOT wrap in markdown code blocks. Output raw JSON only."
 )
 
-USER_PROMPT_TEMPLATE = (
-    'Analyze this football match: "{match_title}"\n'
-    "Home team: {home_team}\n"
-    "Away team: {away_team}\n"
-    "League/Competition: {league}\n"
-    "Match date: {match_date}\n\n"
-    "Consider these fundamental factors:\n"
-    "- Recent form (last 6-10 matches) and xG trends\n"
-    "- Head-to-head record (venue-adjusted)\n"
-    "- Injuries, suspensions, and squad availability\n"
-    "- Fixture congestion and rest days\n"
-    "- Tactical matchup and manager quality\n"
-    "- Home/away performance splits\n\n"
-    "IMPORTANT: Base your analysis ONLY on football fundamentals. "
-    "IGNORE all market data, betting odds, and trading volume. "
-    "Output ONLY the raw JSON object — no markdown, no explanation."
-)
+
+def build_compressed_prompt(home_team: str, away_team: str, league: str,
+                            h_data: str = "Unknown", a_data: str = "Unknown",
+                            h2h: str = "Unknown") -> str:
+    """
+    Build a dense, compressed user prompt (~300 tokens instead of ~3000).
+    Format: [League] | Home: [A] | Away: [B]  H_Data / A_Data / H2H_Venue
+    """
+    return (
+        f"[{league}] | Home: {home_team} | Away: {away_team}\n"
+        f"H_Data: {h_data}\n"
+        f"A_Data: {a_data}\n"
+        f"H2H_Venue: {h2h}\n"
+        f"Output probabilities."
+    )
+
 
 # ── Gamma API ───────────────────────────────────────────────
 
@@ -237,7 +238,6 @@ def _extract_content_from_choice(choice) -> Optional[str]:
         return content
 
     # Reasoning models put their final answer in reasoning_content
-    # (or sometimes the content is empty because all tokens went to reasoning)
     reasoning = getattr(msg, "reasoning_content", None)
     if reasoning and reasoning.strip():
         print(f"[OpenAI] Using reasoning_content ({len(reasoning)} chars)", file=sys.stderr)
@@ -261,15 +261,15 @@ async def fetch_fundamental_probabilities(
     """
     LLM calculates final probabilities directly using bivariate Poisson.
     Python only handles EV and Kelly — no probability math here.
+    Uses compressed prompt format (~300 tokens) for cost efficiency.
     """
     client = get_openai_client()
 
-    user_prompt = USER_PROMPT_TEMPLATE.format(
-        match_title=match_title,
+    # Build compressed user prompt
+    user_prompt = build_compressed_prompt(
         home_team=home_team,
         away_team=away_team,
         league=league,
-        match_date=match_date,
     )
 
     print(f"[OpenAI] Prompt ({len(user_prompt)} chars)", file=sys.stderr)
@@ -280,9 +280,7 @@ async def fetch_fundamental_probabilities(
     ]
 
     # gpt-5.5 is a reasoning model — needs high max_tokens because
-    # reasoning_tokens consume from the same budget as completion_tokens.
-    # 500 tokens was all going to reasoning, leaving 0 for content.
-    # 4000 gives ~3000 for reasoning + 1000 for output.
+    # reasoning_tokens consume from the same budget as completion_tokens
     MAX_TOKENS = 4000
 
     raw = None
@@ -313,11 +311,6 @@ async def fetch_fundamental_probabilities(
                     print(f"  message.content length: {len(choice.message.content) if choice.message.content else 0}", file=sys.stderr)
                     reasoning = getattr(choice.message, "reasoning_content", None)
                     print(f"  message.reasoning_content length: {len(reasoning) if reasoning else 0}", file=sys.stderr)
-                    # Check for tool_calls or function_call
-                    if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls:
-                        print(f"  tool_calls: {choice.message.tool_calls}", file=sys.stderr)
-                    if hasattr(choice.message, 'function_call') and choice.message.function_call:
-                        print(f"  function_call: {choice.message.function_call}", file=sys.stderr)
             else:
                 print(f"  WARNING: response.choices is EMPTY", file=sys.stderr)
 
@@ -331,23 +324,18 @@ async def fetch_fundamental_probabilities(
                 if response.choices:
                     finish = choice.finish_reason
                     if finish == "length":
-                        print(f"[OpenAI] {mode_label}: finish_reason=length — response truncated. Reasoning models need more tokens.", file=sys.stderr)
-                        last_error = ValueError(f"{mode_label} mode: finish_reason=length (reasoning model needs more tokens than {MAX_TOKENS})")
+                        print(f"[OpenAI] {mode_label}: finish_reason=length — response truncated.", file=sys.stderr)
+                        last_error = ValueError(f"{mode_label} mode: finish_reason=length")
                     elif finish == "content_filter":
                         print(f"[OpenAI] {mode_label}: finish_reason=content_filter — prompt was blocked.", file=sys.stderr)
-                        last_error = ValueError(f"{mode_label} mode: finish_reason=content_filter (prompt blocked by safety filter)")
-                    elif finish == "stop" and (not raw or not raw.strip()):
-                        print(f"[OpenAI] {mode_label}: finish_reason=stop but content is empty — model returned nothing.", file=sys.stderr)
-                        last_error = ValueError(f"{mode_label} mode: finish_reason=stop but content is empty")
+                        last_error = ValueError(f"{mode_label} mode: finish_reason=content_filter")
                     else:
                         print(f"[OpenAI] {mode_label}: returned empty content (finish_reason={finish})", file=sys.stderr)
                         last_error = ValueError(f"{mode_label} mode returned empty response (finish_reason={finish})")
                 else:
-                    print(f"[OpenAI] {mode_label}: no choices in response at all", file=sys.stderr)
                     last_error = ValueError(f"{mode_label} mode: response has no choices")
         except ValueError as e:
             last_error = e
-            print(f"[OpenAI] {mode_label} parse failed: {e}", file=sys.stderr)
             if raw and raw.strip():
                 break
         except Exception as e:
@@ -358,7 +346,6 @@ async def fetch_fundamental_probabilities(
     if raw is None or (not raw or not raw.strip()):
         raise ValueError(
             f"All API modes returned empty. Model: {SURPLUS_MODEL}. "
-            f"Check SURPLUS_API_KEY and that the model name is correct. "
             f"Last error: {last_error}"
         )
 
