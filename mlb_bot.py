@@ -157,83 +157,61 @@ def fetch_event_from_gamma(slug: str) -> Optional[dict]:
     return None
 
 
-def _team_in_question(team_name: str, question: str) -> bool:
-    """Check if team name appears as a word or meaningful substring in question."""
-    if not team_name or not question:
+def _team_match(name: str, question: str) -> bool:
+    """True if team name appears in question (case-insensitive substring)."""
+    if not name or not question:
         return False
+    return name.lower() in question.lower()
+
+
+def _question_is_moneyline(question: str) -> bool:
+    """True if question is a moneyline market — not spread/O/U/prop."""
     q = question.lower()
-    name = team_name.lower().strip()
-    if name in q:
-        return True
-    for word in name.split():
-        if len(word) > 3 and word in q:
-            return True
-    return False
-
-
-def _question_is_bare_team(question: str, team_names: list) -> Optional[str]:
-    """
-    Check if question is JUST a bare team name — no "moneyline", "win", etc.
-    Polymarket sometimes uses bare "[Team Name]" as the moneyline question.
-    Returns "away" or "home" if matched, None if not a bare team name.
-    """
-    q = question.lower().strip()
-    half = max(len(team_names) // 2, 1)
-    for i, name in enumerate(team_names):
-        if q == name:
-            return "away" if i < half else "home"
-    # Also try: "Team Name " (team name plus anything — for "Team (Moneyline)" etc)
-    return None
+    skip = ["spread:", "o/u", "over/under", "innings", "extra innings",
+            "1st 5", "strikeout", "home run", "hits", "runs", "total bases"]
+    return not any(s in q for s in skip)
 
 
 def extract_mlb_markets_from_event(event: dict) -> list[dict]:
-    """
-    Extract moneyline markets from an MLB Polymarket event.
-    
-    Polymarket MLB formats:
-      - "[Team Name]" (bare — no suffix)          ← MOST COMMON
-      - "[Team Name] (Moneyline)" 
-      - "Moneyline: [Team Name]"
-      - "Will [Team] win?"                        ← older format
-    Spread / O/U / props are IGNORED.
-    """
     markets = event.get("markets", [])
-    title = (event.get("title") or "").lower()
     teams = event.get("teams", [])
 
-    team_names = []
-    for t in teams:
-        name = (t.get("name") or "").lower().strip()
-        short = (t.get("shortName") or t.get("abbreviation") or "").lower().strip()
-        if name:
-            team_names.append(name)
-        if short and short != name:
-            team_names.append(short)
+    # Build clean team objects — use full name, short name, abbreviation
+    away_team_obj = teams[0] if len(teams) >= 1 else {"name": ""}
+    home_team_obj = teams[1] if len(teams) >= 2 else {"name": ""}
 
-    away_name = team_names[0] if len(team_names) >= 1 else ""
-    home_name = team_names[1] if len(team_names) >= 2 else ""
+    away_full = (away_team_obj.get("name") or "").lower().strip()
+    home_full = (home_team_obj.get("name") or "").lower().strip()
+    away_short = (away_team_obj.get("shortName") or away_team_obj.get("abbreviation") or "").lower().strip()
+    home_short = (home_team_obj.get("shortName") or home_team_obj.get("abbreviation") or "").lower().strip()
 
-    # Parse title for team names as fallback
+    # Names to check per team (full + abbreviation/shortName)
+    away_names = [n for n in [away_full, away_short] if n]
+    home_names = [n for n in [home_full, home_short] if n]
+
+    title = (event.get("title") or "").lower()
+
+    # Parse title teams as fallback
     title_away = title_home = ""
     if " vs " in title:
         parts = [p.strip() for p in title.split(" vs ")]
         if len(parts) >= 2:
-            title_away, title_home = parts[0].lower(), parts[1].lower()
+            title_away, title_home = parts[0], parts[1]
     elif " @ " in title:
         parts = [p.strip() for p in title.split(" @ ")]
         if len(parts) >= 2:
-            title_away, title_home = parts[0].lower(), parts[1].lower()
+            title_away, title_home = parts[0], parts[1]
 
-    # ── DEBUG ──
+    # ── DEBUG: dump all info ──
     print(f"[MLB Markets] Event title: '{title}'", file=sys.stderr)
-    print(f"[MLB Markets] Teams from Gamma: away='{away_name}', home='{home_name}'", file=sys.stderr)
+    print(f"[MLB Markets] Away: full='{away_full}' short='{away_short}' | Home: full='{home_full}' short='{home_short}'", file=sys.stderr)
     print(f"[MLB Markets] Title teams: away='{title_away}', home='{title_home}'", file=sys.stderr)
-    print(f"[MLB Markets] All team names: {team_names}", file=sys.stderr)
+    print(f"[MLB Markets] Away search names: {away_names}", file=sys.stderr)
+    print(f"[MLB Markets] Home search names: {home_names}", file=sys.stderr)
     print(f"[MLB Markets] ===== ALL {len(markets)} MARKETS (pre-filter) =====", file=sys.stderr)
     for i, m in enumerate(markets):
         q = m.get("question", "NO_QUESTION")
-        cids = m.get("clobTokenIds", "[]")
-        print(f"[MLB Markets]   [{i}] question='{q}' clobTokenIds={cids}", file=sys.stderr)
+        print(f"[MLB Markets]   [{i}] '{q}'", file=sys.stderr)
 
     result = []
 
@@ -250,72 +228,44 @@ def extract_mlb_markets_from_event(event: dict) -> list[dict]:
             except (json.JSONDecodeError, TypeError):
                 clob_ids = []
         if not clob_ids or len(clob_ids) == 0:
-            print(f"[MLB Markets]   [{i}] SKIP (no clobTokenIds): '{question_raw[:80]}'", file=sys.stderr)
+            print(f"[MLB Markets]   [{i}] SKIP (no clobTokenIds)", file=sys.stderr)
+            continue
+
+        # Filter: moneyline only
+        if not _question_is_moneyline(question):
+            print(f"[MLB Markets]   [{i}] SKIP (non-moneyline): '{question_raw[:80]}'", file=sys.stderr)
             continue
 
         token_id = clob_ids[0]
 
-        # ── Skip non-moneyline markets ──
-        skip_keywords = ["spread:", "o/u", "over/under", "innings",
-                         "extra innings", "1st 5", "strikeout", "home run",
-                         "hits", "runs", "total bases"]
-        if any(sk in question for sk in skip_keywords):
-            print(f"[MLB Markets]   [{i}] SKIP (non-moneyline): '{question_raw[:80]}'", file=sys.stderr)
+        # Determine: away or home?
+        away_match = any(_team_match(n, question) for n in away_names)
+        home_match = any(_team_match(n, question) for n in home_names)
+
+        if away_match and not home_match:
+            market_type = "away"
+        elif home_match and not away_match:
+            market_type = "home"
+        elif away_match and home_match:
+            # Both match — pick the one appearing first
+            away_pos = min((question.find(n) for n in away_names if n in question), default=999)
+            home_pos = min((question.find(n) for n in home_names if n in question), default=999)
+            market_type = "away" if away_pos < home_pos else "home"
+        elif title_away and any(_team_match(n, question) for n in [title_away]):
+            market_type = "away"
+        elif title_home and any(_team_match(n, question) for n in [title_home]):
+            market_type = "home"
+        else:
+            print(f"[MLB Markets]   [{i}] UNMATCHED: '{question_raw[:80]}'", file=sys.stderr)
             continue
 
-        # ── Determine market type ──
-        market_type = None
-
-        # Strategy 1: Bare team name — e.g. "Cleveland Guardians" 
-        bare_match = _question_is_bare_team(question, team_names)
-        if bare_match:
-            market_type = bare_match
-            print(f"[MLB Markets]   [{i}] MATCHED (bare team): type={market_type} question='{question_raw[:80]}'", file=sys.stderr)
-
-        # Strategy 2: "(Moneyline)" format
-        if market_type is None and "moneyline" in question:
-            if _team_in_question(away_name, question):
-                market_type = "away"
-            elif _team_in_question(home_name, question):
-                market_type = "home"
-            elif _team_in_question(title_away, question):
-                market_type = "away"
-            elif _team_in_question(title_home, question):
-                market_type = "home"
-            if market_type:
-                print(f"[MLB Markets]   [{i}] MATCHED (moneyline keyword): type={market_type} question='{question_raw[:80]}'", file=sys.stderr)
-
-        # Strategy 3: "Will [Team] win?" format
-        if market_type is None and ("win" in question or "defeat" in question or "beat" in question):
-            if _team_in_question(away_name, question) and not _team_in_question(home_name, question):
-                market_type = "away"
-            elif _team_in_question(home_name, question) and not _team_in_question(away_name, question):
-                market_type = "home"
-            elif _team_in_question(away_name, question) and _team_in_question(home_name, question):
-                away_pos = question.find(away_name) if away_name in question else 999
-                home_pos = question.find(home_name) if home_name in question else 999
-                market_type = "away" if away_pos < home_pos else "home"
-            if market_type:
-                print(f"[MLB Markets]   [{i}] MATCHED (win/beat format): type={market_type} question='{question_raw[:80]}'", file=sys.stderr)
-
-        # Strategy 4: Brute force — match ANY team name
-        if market_type is None:
-            for i_name, name in enumerate(team_names):
-                if _team_in_question(name, question):
-                    half = max(len(team_names) // 2, 1)
-                    market_type = "away" if i_name < half else "home"
-                    print(f"[MLB Markets]   [{i}] MATCHED (brute force): type={market_type} team='{name}' question='{question_raw[:80]}'", file=sys.stderr)
-                    break
-
-        if market_type:
-            result.append({
-                "type": market_type,
-                "token_id": token_id,
-                "question": question_raw,
-                "slug": m.get("slug", ""),
-            })
-        else:
-            print(f"[MLB Markets]   [{i}] UNMATCHED (could not determine team): '{question_raw[:80]}'", file=sys.stderr)
+        result.append({
+            "type": market_type,
+            "token_id": token_id,
+            "question": question_raw,
+            "slug": m.get("slug", ""),
+        })
+        print(f"[MLB Markets]   [{i}] MATCHED: type={market_type} '{question_raw[:80]}'", file=sys.stderr)
 
     away_count = sum(1 for r in result if r['type'] == 'away')
     home_count = sum(1 for r in result if r['type'] == 'home')
@@ -462,7 +412,6 @@ async def fetch_sabermetric_variables(
     ]):
         try:
             response = await client.chat.completions.create(model=SURPLUS_MODEL, messages=messages, **kwargs)
-            print(f"[OpenAI] model={response.model} usage={response.usage}", file=sys.stderr)
             if response.choices:
                 choice = response.choices[0]
                 raw = _extract_content_from_choice(choice)
@@ -482,7 +431,6 @@ async def fetch_sabermetric_variables(
                 break
         except Exception as e:
             last_error = e
-            print(f"[OpenAI] {mode_label} API call failed: {type(e).__name__}: {e}", file=sys.stderr)
 
     if data is None:
         raise ValueError(f"All API modes failed. Model: {SURPLUS_MODEL}. Last error: {last_error}")
@@ -689,8 +637,6 @@ async def cmd_mlb(ctx, *, args: str = ""):
         if not slug:
             await ctx.send("❌ Could not extract event slug from URL."); return
 
-        print(f"[MLB CMD] Extracted slug: '{slug}'", file=sys.stderr)
-
         async with ctx.typing():
             event = await asyncio.to_thread(fetch_event_from_gamma, slug)
             if not event:
@@ -735,8 +681,6 @@ async def cmd_mlb(ctx, *, args: str = ""):
                 if m:
                     price = await asyncio.to_thread(fetch_clob_best_ask, m["token_id"])
                     clob_prices[outcome_type] = {"price": price, "token_id": m["token_id"], "question": m.get("question", "")}
-
-            print(f"[MLB CMD] CLOB: away={clob_prices.get('away',{}).get('price')}, home={clob_prices.get('home',{}).get('price')}", file=sys.stderr)
 
             try:
                 sm = await fetch_sabermetric_variables(
