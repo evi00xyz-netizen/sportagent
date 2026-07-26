@@ -50,7 +50,7 @@ class MatchProbabilities(BaseModel):
     justification: str = Field(...)
     confidence: float = Field(..., ge=0.0, le=1.0)
 
-# ── Prompts (verbose format — known to work with Surplus) ──
+# ── Prompts ─────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
     "You are a football probability engine. "
@@ -261,15 +261,51 @@ async def fetch_fundamental_probabilities(
                 messages=messages,
                 **kwargs,
             )
-            raw = response.choices[0].message.content
-            print(f"[OpenAI] {mode_label} response ({len(raw) if raw else 0} chars): {repr(raw)[:300]}", file=sys.stderr)
+
+            # ── Full response object logging ──
+            print(f"[OpenAI] Full response object:", file=sys.stderr)
+            print(f"  model: {response.model}", file=sys.stderr)
+            print(f"  usage: {response.usage}", file=sys.stderr)
+            print(f"  choices count: {len(response.choices)}", file=sys.stderr)
+            if response.choices:
+                choice = response.choices[0]
+                print(f"  finish_reason: {choice.finish_reason}", file=sys.stderr)
+                print(f"  message.role: {choice.message.role if choice.message else 'NONE'}", file=sys.stderr)
+                print(f"  message.content length: {len(choice.message.content) if choice.message and choice.message.content else 0}", file=sys.stderr)
+                print(f"  message.content repr: {repr(choice.message.content) if choice.message else 'NONE'}", file=sys.stderr)
+                # Check for tool_calls or function_call (some models use these instead of content)
+                if choice.message:
+                    if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls:
+                        print(f"  tool_calls: {choice.message.tool_calls}", file=sys.stderr)
+                    if hasattr(choice.message, 'function_call') and choice.message.function_call:
+                        print(f"  function_call: {choice.message.function_call}", file=sys.stderr)
+            else:
+                print(f"  WARNING: response.choices is EMPTY", file=sys.stderr)
+
+            raw = choice.message.content if response.choices and choice.message else None
 
             if raw and raw.strip():
                 data = _extract_json_from_text(raw)
                 break
             else:
-                print(f"[OpenAI] {mode_label} returned empty, trying next mode...", file=sys.stderr)
-                last_error = ValueError(f"{mode_label} mode returned empty response")
+                # Diagnose why it's empty
+                if response.choices:
+                    finish = choice.finish_reason
+                    if finish == "length":
+                        print(f"[OpenAI] {mode_label}: finish_reason=length — response truncated. Increase max_tokens.", file=sys.stderr)
+                        last_error = ValueError(f"{mode_label} mode: finish_reason=length (response truncated, increase max_tokens)")
+                    elif finish == "content_filter":
+                        print(f"[OpenAI] {mode_label}: finish_reason=content_filter — prompt was blocked.", file=sys.stderr)
+                        last_error = ValueError(f"{mode_label} mode: finish_reason=content_filter (prompt blocked by safety filter)")
+                    elif finish == "stop" and (not raw or not raw.strip()):
+                        print(f"[OpenAI] {mode_label}: finish_reason=stop but content is empty — model returned nothing.", file=sys.stderr)
+                        last_error = ValueError(f"{mode_label} mode: finish_reason=stop but content is empty")
+                    else:
+                        print(f"[OpenAI] {mode_label}: returned empty content (finish_reason={finish})", file=sys.stderr)
+                        last_error = ValueError(f"{mode_label} mode returned empty response (finish_reason={finish})")
+                else:
+                    print(f"[OpenAI] {mode_label}: no choices in response at all", file=sys.stderr)
+                    last_error = ValueError(f"{mode_label} mode: response has no choices")
         except ValueError as e:
             last_error = e
             print(f"[OpenAI] {mode_label} parse failed: {e}", file=sys.stderr)
@@ -277,11 +313,18 @@ async def fetch_fundamental_probabilities(
                 break
         except Exception as e:
             last_error = e
-            print(f"[OpenAI] {mode_label} API call failed: {e}", file=sys.stderr)
+            print(f"[OpenAI] {mode_label} API call failed: {type(e).__name__}: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
 
     if raw is None or (not raw or not raw.strip()):
+        # Check if model name might be wrong
+        model_hint = ""
+        if SURPLUS_MODEL == "gpt-5.5":
+            model_hint = " (model 'gpt-5.5' may not exist — try 'gpt-5.4' or 'gpt-4o')"
+        elif SURPLUS_MODEL == "gpt-5.4":
+            model_hint = " (model 'gpt-5.4' may not exist — try 'gpt-4o' or 'gpt-4-turbo')"
         raise ValueError(
-            f"All API modes returned empty. Model: {SURPLUS_MODEL}. "
+            f"All API modes returned empty. Model: {SURPLUS_MODEL}{model_hint}. "
             f"Check SURPLUS_API_KEY and that the model name is correct. "
             f"Last error: {last_error}"
         )
