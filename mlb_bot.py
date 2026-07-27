@@ -39,12 +39,13 @@ def _strip_none(d: dict) -> dict:
     """Remove keys with None values so Pydantic defaults apply."""
     return {k: v for k, v in d.items() if v is not None}
 
-def _extract_date_ymd(raw: str) -> str:
-    """Extract YYYY-MM-DD from an ISO timestamp or date string."""
+def _extract_date_ymd(raw) -> str:
+    """Extract YYYY-MM-DD from an ISO timestamp, date string, or 'YYYY-MM-DD HH:MM:SS+00' format."""
     if not raw or raw == "Unknown":
         return "Unknown"
-    m = re.match(r'(\d{4}-\d{2}-\d{2})', str(raw))
-    return m.group(1) if m else str(raw)[:10]
+    s = str(raw).strip()
+    m = re.match(r'(\d{4}-\d{2}-\d{2})', s)
+    return m.group(1) if m else s[:10]
 
 # ── Pydantic Output Schema ──────────────────────────────────
 
@@ -268,6 +269,11 @@ def _parse_json_array(val) -> list:
 
 
 def extract_mlb_markets_from_event(event: dict) -> list[dict]:
+    """
+    Extract moneyline markets from a Gamma event.
+    Returns a list of dicts with type, token_id, question, team_name.
+    Also returns the game date extracted from the moneyline market's gameStartTime.
+    """
     markets = event.get("markets", [])
     title = (event.get("title") or "").lower()
 
@@ -276,9 +282,11 @@ def extract_mlb_markets_from_event(event: dict) -> list[dict]:
     for i, m in enumerate(markets):
         q = m.get("question", "NO_QUESTION")
         mt = m.get("sportsMarketType", "none")
-        print(f"[MLB Markets]   [{i}] type={mt} q='{q[:80]}'", file=sys.stderr)
+        gst = m.get("gameStartTime", "none")
+        print(f"[MLB Markets]   [{i}] type={mt} gameStartTime={gst} q='{q[:80]}'", file=sys.stderr)
 
     result = []
+    game_date = "Unknown"
 
     for i, m in enumerate(markets):
         market_type = m.get("sportsMarketType", "")
@@ -295,6 +303,12 @@ def extract_mlb_markets_from_event(event: dict) -> list[dict]:
         if len(outcomes) < 2:
             print(f"[MLB Markets]   [{i}] SKIP (not enough outcomes: {len(outcomes)})", file=sys.stderr)
             continue
+
+        # Extract game date from market's gameStartTime (NOT event startDate — that's market creation date)
+        gst = m.get("gameStartTime", "")
+        if gst:
+            game_date = _extract_date_ymd(gst)
+            print(f"[MLB Markets]   [{i}] Game date from gameStartTime: {game_date}", file=sys.stderr)
 
         away_team = outcomes[0]
         home_team = outcomes[1]
@@ -314,11 +328,11 @@ def extract_mlb_markets_from_event(event: dict) -> list[dict]:
             "team_name": home_team,
         })
 
-        print(f"[MLB Markets]   [{i}] -> MONEYLINE: away='{away_team}' home='{home_team}'", file=sys.stderr)
+        print(f"[MLB Markets]   [{i}] -> MONEYLINE: away='{away_team}' home='{home_team}' date={game_date}", file=sys.stderr)
         break
 
-    print(f"[MLB Markets] Total: {len(result)} (away={'yes' if any(r['type']=='away' for r in result) else 'NO'}, home={'yes' if any(r['type']=='home' for r in result) else 'NO'})", file=sys.stderr)
-    return result
+    print(f"[MLB Markets] Total: {len(result)} (away={'yes' if any(r['type']=='away' for r in result) else 'NO'}, home={'yes' if any(r['type']=='home' for r in result) else 'NO'}) game_date={game_date}", file=sys.stderr)
+    return result, game_date
 
 
 def parse_polymarket_url(url: str) -> Optional[str]:
@@ -655,7 +669,7 @@ async def cmd_mlb(ctx, *, args: str = ""):
 
             title = event.get("title", slug)
 
-            markets = extract_mlb_markets_from_event(event)
+            markets, game_date = extract_mlb_markets_from_event(event)
 
             if len(markets) < 2:
                 await ctx.send(
@@ -682,12 +696,11 @@ async def cmd_mlb(ctx, *, args: str = ""):
 
             series = event.get("series", [])
             league = series[0].get("title", "MLB") if isinstance(series, list) and series else "MLB"
-            raw_date = event.get("startDate") or event.get("scheduledStart") or "Unknown"
-            match_date = _extract_date_ymd(str(raw_date))
 
             # ── Scrape probable pitchers from MLB Stats API ──
+            print(f"[MLB CMD] Looking up pitchers: {away_team} @ {home_team} on {game_date}", file=sys.stderr)
             away_pitcher_name, home_pitcher_name = await asyncio.to_thread(
-                lookup_pitchers, away_team, home_team, match_date
+                lookup_pitchers, away_team, home_team, game_date
             )
             print(f"[MLB CMD] Pitchers: {away_team} -> {away_pitcher_name}, {home_team} -> {home_pitcher_name}", file=sys.stderr)
 
@@ -701,7 +714,7 @@ async def cmd_mlb(ctx, *, args: str = ""):
             try:
                 sm = await fetch_sabermetric_variables(
                     match_title=title, away_team=away_team, home_team=home_team,
-                    match_date=match_date,
+                    match_date=game_date,
                     away_pitcher=away_pitcher_name,
                     home_pitcher=home_pitcher_name,
                 )
@@ -719,7 +732,7 @@ async def cmd_mlb(ctx, *, args: str = ""):
 
             embed = discord.Embed(
                 title=f"⚾ MLB Sabermetric Analysis: {sm.match_name}",
-                description=(f"**League:** {league} | **Date:** {match_date}\n"
+                description=(f"**League:** {league} | **Date:** {game_date}\n"
                            f"**Venue:** {sm.venue.stadium_name}\n"
                            f"**Staking:** {kelly_label} | **Bankroll:** ${bankroll:,.2f} | **Threshold:** {threshold*100:.1f}%"),
                 color=discord.Color.dark_green(),
