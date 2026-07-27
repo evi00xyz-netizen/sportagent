@@ -425,7 +425,9 @@ async def fetch_sabermetric_variables(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
-    MAX_TOKENS = 4000
+    # Reasoning models (gpt-5.x) spend ~3000 tokens thinking internally.
+    # 8000 max_tokens gives them 5000+ tokens of headroom for the JSON output.
+    MAX_TOKENS = 8000
     raw = None
     last_error = None
     data = None
@@ -444,7 +446,7 @@ async def fetch_sabermetric_variables(
                     break
                 finish = choice.finish_reason
                 if finish == "length":
-                    last_error = ValueError(f"{mode_label} mode: finish_reason=length")
+                    last_error = ValueError(f"{mode_label} mode: finish_reason=length (max_tokens={MAX_TOKENS} too low for reasoning model)")
                 else:
                     last_error = ValueError(f"{mode_label} mode returned empty (finish_reason={finish})")
             else:
