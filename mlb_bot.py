@@ -1,6 +1,6 @@
 """
-mlb_bot.py — MLB Sabermetric EV Betting Bot (Kelly Criterion Mode)
-=====================================================================
+mlb_bot.py — MLB Sabermetric EV Betting Bot + AI Chatbot (Kelly Criterion Mode)
+================================================================================
 Architecture:
   1. Gamma API         → fetch MLB market data + clobTokenIds
   2. MLB Stats API     → scrape probable pitchers for today's games
@@ -9,6 +9,17 @@ Architecture:
   5. CLOB API          → live best-ask prices → decimal odds
   6. EV Math           → EV = (prob * odds) - 1
   7. Kelly Staking     → f* = EV / (odds - 1), scaled by kelly fraction
+
+Commands:
+  !mlb <url>           → Sabermetric analysis + EV + Kelly
+  !mlb threshold <x>   → Set EV threshold
+  !mlb kelly <x>       → Set Kelly fraction
+  !mlb bankroll <x>    → Set bankroll
+  !mlbstatus           → Show config
+  !ask <question>      → General AI chat (same model, same API)
+  !clear               → Clear chat history
+  !chatmodel           → Show current model
+  !chathelp            → Chat help
 
 Strict separation: LLM outputs raw structural data only.
 ALL final probability calculations, risk management, and execution
@@ -32,6 +43,15 @@ SURPLUS_MODEL      = os.getenv("SURPLUS_MODEL", "gpt-5.4")
 DEFAULT_EV_THRESHOLD = float(os.getenv("EV_THRESHOLD", "0.05"))
 DEFAULT_KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.5"))
 DEFAULT_BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
+
+# ── Chatbot config ──────────────────────────────────────────
+CHAT_SYSTEM_PROMPT = (
+    "You are a helpful, knowledgeable AI assistant running on the Surplus API. "
+    "Answer questions concisely and accurately. Use bullet points for lists. "
+    "Keep responses skimmable. No markdown code blocks unless the user asks for code. "
+    "If you don't know something, say so — don't guess."
+)
+MAX_CHAT_HISTORY = 20
 
 # ── Helpers ─────────────────────────────────────────────────
 
@@ -476,6 +496,20 @@ async def fetch_sabermetric_variables(
     )
 
 
+async def chat_completion(messages: list, *, temperature: float = 0.7, max_tokens: int = 2000) -> str:
+    """Send a conversation to Surplus API and return the response text."""
+    client = get_openai_client()
+    response = await client.chat.completions.create(
+        model=SURPLUS_MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    if response.choices and response.choices[0].message:
+        return response.choices[0].message.content or "(empty response)"
+    return "(no response)"
+
+
 # ── Probability Calculation (Python only) ───────────────────
 
 def sabermetrics_to_probabilities(sm: SabermetricOutput) -> dict:
@@ -595,6 +629,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ── Per-guild config ────────────────────────────────────────
 ev_thresholds = {}
 kelly_fractions = {}
 bankrolls = {}
@@ -606,6 +641,17 @@ def set_kelly_fraction(gid, f): kelly_fractions[gid] = f
 def get_bankroll(gid): return bankrolls.get(gid, DEFAULT_BANKROLL)
 def set_bankroll(gid, b): bankrolls[gid] = b
 
+# ── Per-channel chat history ────────────────────────────────
+chat_histories: dict[int, list[dict]] = {}
+
+def get_chat_history(channel_id: int) -> list[dict]:
+    if channel_id not in chat_histories:
+        chat_histories[channel_id] = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+    return chat_histories[channel_id]
+
+# ═══════════════════════════════════════════════════════════
+# MLB COMMAND
+# ═══════════════════════════════════════════════════════════
 
 @bot.command(name="mlb")
 async def cmd_mlb(ctx, *, args: str = ""):
@@ -619,6 +665,10 @@ async def cmd_mlb(ctx, *, args: str = ""):
             "`!mlb kelly <0.5>` — Set Kelly fraction\n"
             "`!mlb bankroll <1000>` — Set bankroll size\n"
             "`!mlbstatus` — Show current config\n\n"
+            "**AI Chatbot:**\n"
+            "`!ask <question>` — Ask the AI anything\n"
+            "`!clear` — Clear chat history\n"
+            "`!chatmodel` — Show current model\n\n"
             "**How it works:**\n"
             "1. Python scrapes probable pitchers from MLB Stats API\n"
             "2. AI extracts sabermetric variables (xFIP, wRC+, bullpen, park factors)\n"
@@ -838,6 +888,73 @@ async def cmd_mlb(ctx, *, args: str = ""):
             pass
 
 
+# ═══════════════════════════════════════════════════════════
+# AI CHAT COMMANDS
+# ═══════════════════════════════════════════════════════════
+
+@bot.command(name="ask")
+async def cmd_ask(ctx, *, question: str = ""):
+    """Ask the AI anything. !ask <your question>"""
+    if not question.strip():
+        await ctx.send("Usage: `!ask <your question>`\nExample: `!ask what is xFIP in baseball?`")
+        return
+
+    channel_id = ctx.channel.id
+    history = get_chat_history(channel_id)
+    history.append({"role": "user", "content": question})
+
+    # Trim to last N messages + system prompt
+    if len(history) > MAX_CHAT_HISTORY + 1:
+        chat_histories[channel_id] = [history[0]] + history[-(MAX_CHAT_HISTORY):]
+        history = chat_histories[channel_id]
+
+    async with ctx.typing():
+        try:
+            reply = await chat_completion(history)
+            history.append({"role": "assistant", "content": reply})
+
+            if len(reply) <= 2000:
+                await ctx.send(reply)
+            else:
+                chunks = [reply[i:i+2000] for i in range(0, len(reply), 2000)]
+                for chunk in chunks:
+                    await ctx.send(chunk)
+        except Exception as e:
+            await ctx.send(f"❌ **API Error**: {type(e).__name__}: {e}")
+            if history and history[-1]["role"] == "user":
+                history.pop()
+
+
+@bot.command(name="clear")
+async def cmd_clear(ctx):
+    """Clear conversation history for this channel."""
+    chat_histories.pop(ctx.channel.id, None)
+    await ctx.send("✅ Chat history cleared.")
+
+
+@bot.command(name="chatmodel")
+async def cmd_chatmodel(ctx):
+    """Show current AI model."""
+    await ctx.send(f"**Model:** `{SURPLUS_MODEL}`\n**API:** `{SURPLUS_BASE_URL}`")
+
+
+@bot.command(name="chathelp")
+async def cmd_chathelp(ctx):
+    """Show chat help."""
+    await ctx.send(
+        "**AI Chatbot Commands**\n"
+        "`!ask <question>` — Ask the AI anything\n"
+        "`!clear` — Clear chat history for this channel\n"
+        "`!chatmodel` — Show current model\n"
+        "`!chathelp` — Show this help\n\n"
+        f"**Model:** `{SURPLUS_MODEL}` | **Context:** last {MAX_CHAT_HISTORY} messages per channel"
+    )
+
+
+# ═══════════════════════════════════════════════════════════
+# STATUS & EVENTS
+# ═══════════════════════════════════════════════════════════
+
 @bot.command(name="mlbstatus")
 async def cmd_mlb_status(ctx):
     gid = ctx.guild.id if ctx.guild else ctx.author.id
@@ -847,7 +964,7 @@ async def cmd_mlb_status(ctx):
     await ctx.send(embed=discord.Embed(
         title="⚾ MLB Bot Status",
         description="\n".join([
-            f"**Mode:** MLB Sabermetric + Kelly Criterion",
+            f"**Mode:** MLB Sabermetric + Kelly Criterion + AI Chat",
             f"**EV Threshold:** {get_ev_threshold(gid)*100:.1f}%",
             f"**Kelly Fraction:** {kelly_frac} ({kelly_label})",
             f"**Bankroll:** ${get_bankroll(gid):,.2f}",
@@ -876,7 +993,7 @@ async def on_command_error(ctx, error):
 
 async def main():
     if not DISCORD_TOKEN:
-        print("FATAL: MLB_BOT_TOKEN or DISCORD_BOT_TOKEN not set", file=sys.stderr)
+        print("FATAL: DISCORD_BOT_TOKEN not set", file=sys.stderr)
         sys.exit(1)
     async with bot:
         await bot.start(DISCORD_TOKEN)
