@@ -39,6 +39,13 @@ def _strip_none(d: dict) -> dict:
     """Remove keys with None values so Pydantic defaults apply."""
     return {k: v for k, v in d.items() if v is not None}
 
+def _extract_date_ymd(raw: str) -> str:
+    """Extract YYYY-MM-DD from an ISO timestamp or date string."""
+    if not raw or raw == "Unknown":
+        return "Unknown"
+    m = re.match(r'(\d{4}-\d{2}-\d{2})', str(raw))
+    return m.group(1) if m else str(raw)[:10]
+
 # ── Pydantic Output Schema ──────────────────────────────────
 
 class PitcherData(BaseModel):
@@ -157,7 +164,7 @@ USER_PROMPT_TEMPLATE = (
 
 def fetch_probable_pitchers(date_str: str) -> dict:
     """
-    Fetch probable pitchers from MLB Stats API for a given date.
+    Fetch probable pitchers from MLB Stats API for a given date (YYYY-MM-DD).
     Returns a dict keyed by (away_team_lower, home_team_lower) -> (away_pitcher, home_pitcher).
     """
     url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}&hydrate=probablePitcher"
@@ -169,13 +176,16 @@ def fetch_probable_pitchers(date_str: str) -> dict:
             if resp.status != 200:
                 print(f"[MLB API] HTTP {resp.status} for {date_str}", file=sys.stderr)
                 return result
-            data = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            data = json.loads(raw)
     except Exception as e:
         print(f"[MLB API] Failed to fetch probable pitchers for {date_str}: {e}", file=sys.stderr)
         return result
 
-    dates = data.get("dates", [])
-    for d in dates:
+    total_games = sum(len(d.get("games", [])) for d in data.get("dates", []))
+    print(f"[MLB API] {total_games} games found for {date_str}", file=sys.stderr)
+
+    for d in data.get("dates", []):
         for game in d.get("games", []):
             away = game.get("teams", {}).get("away", {})
             home = game.get("teams", {}).get("home", {})
@@ -186,9 +196,9 @@ def fetch_probable_pitchers(date_str: str) -> dict:
 
             if away_team and home_team:
                 result[(away_team, home_team)] = (away_pitcher, home_pitcher)
-                print(f"[MLB API] {away_team} @ {home_team}: {away_pitcher} vs {home_pitcher}", file=sys.stderr)
+                print(f"[MLB API]   {away_team} @ {home_team}: {away_pitcher} vs {home_pitcher}", file=sys.stderr)
 
-    print(f"[MLB API] Loaded {len(result)} games for {date_str}", file=sys.stderr)
+    print(f"[MLB API] Loaded {len(result)} matchups for {date_str}", file=sys.stderr)
     return result
 
 
@@ -198,13 +208,19 @@ def lookup_pitchers(away_team: str, home_team: str, date_str: str) -> tuple[str,
     then partial (substring) match as fallback.
     Returns (away_pitcher_name, home_pitcher_name).
     """
-    pitchers = fetch_probable_pitchers(date_str)
+    ymd = _extract_date_ymd(date_str)
+    if ymd == "Unknown":
+        print(f"[MLB API] Cannot look up pitchers — unknown date", file=sys.stderr)
+        return ("TBD", "TBD")
+
+    pitchers = fetch_probable_pitchers(ymd)
     away_lower = away_team.lower().strip()
     home_lower = home_team.lower().strip()
 
     # Exact match
     key = (away_lower, home_lower)
     if key in pitchers:
+        print(f"[MLB API] Exact match: '{away_lower}' @ '{home_lower}'", file=sys.stderr)
         return pitchers[key]
 
     # Partial match — check if team names are substrings
@@ -219,7 +235,7 @@ def lookup_pitchers(away_team: str, home_team: str, date_str: str) -> tuple[str,
             print(f"[MLB API] Swapped match: '{away_lower}'->'{h}', '{home_lower}'->'{a}'", file=sys.stderr)
             return (hp, ap)
 
-    print(f"[MLB API] No match for '{away_lower}' @ '{home_lower}' on {date_str}", file=sys.stderr)
+    print(f"[MLB API] No match for '{away_lower}' @ '{home_lower}' on {ymd}. Available: {list(pitchers.keys())}", file=sys.stderr)
     return ("TBD", "TBD")
 
 
@@ -666,11 +682,12 @@ async def cmd_mlb(ctx, *, args: str = ""):
 
             series = event.get("series", [])
             league = series[0].get("title", "MLB") if isinstance(series, list) and series else "MLB"
-            match_date = event.get("startDate") or event.get("scheduledStart") or "Unknown"
+            raw_date = event.get("startDate") or event.get("scheduledStart") or "Unknown"
+            match_date = _extract_date_ymd(str(raw_date))
 
             # ── Scrape probable pitchers from MLB Stats API ──
             away_pitcher_name, home_pitcher_name = await asyncio.to_thread(
-                lookup_pitchers, away_team, home_team, str(match_date)
+                lookup_pitchers, away_team, home_team, match_date
             )
             print(f"[MLB CMD] Pitchers: {away_team} -> {away_pitcher_name}, {home_team} -> {home_pitcher_name}", file=sys.stderr)
 
@@ -684,7 +701,7 @@ async def cmd_mlb(ctx, *, args: str = ""):
             try:
                 sm = await fetch_sabermetric_variables(
                     match_title=title, away_team=away_team, home_team=home_team,
-                    match_date=str(match_date),
+                    match_date=match_date,
                     away_pitcher=away_pitcher_name,
                     home_pitcher=home_pitcher_name,
                 )
