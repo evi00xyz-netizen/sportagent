@@ -3,11 +3,12 @@ mlb_bot.py — MLB Sabermetric EV Betting Bot (Kelly Criterion Mode)
 =====================================================================
 Architecture:
   1. Gamma API         → fetch MLB market data + clobTokenIds
-  2. OpenAI (gpt-5.4)  → isolated sabermetric variables (NOT probabilities)
-  3. Python Backend    → deterministic probability calculation from sabermetrics
-  4. CLOB API          → live best-ask prices → decimal odds
-  5. EV Math           → EV = (prob * odds) - 1
-  6. Kelly Staking     → f* = EV / (odds - 1), scaled by kelly fraction
+  2. MLB Stats API     → scrape probable pitchers for today's games
+  3. OpenAI (gpt-5.4)  → isolated sabermetric variables (NOT probabilities)
+  4. Python Backend    → deterministic probability calculation from sabermetrics
+  5. CLOB API          → live best-ask prices → decimal odds
+  6. EV Math           → EV = (prob * odds) - 1
+  7. Kelly Staking     → f* = EV / (odds - 1), scaled by kelly fraction
 
 Strict separation: LLM outputs raw structural data only.
 ALL final probability calculations, risk management, and execution
@@ -94,12 +95,9 @@ SYSTEM_PROMPT = (
     "   - You MUST automatically fill the venue based on the home team (e.g., Phillies = "
     "Citizens Bank Park, Giants = Oracle Park, Yankees = Yankee Stadium, Dodgers = "
     "Dodger Stadium).\n\n"
-    "2. **MANDATORY STARTING PITCHER LOOKUP (Never Output 'TBD' without searching):**\n"
-    "   - You MUST search live MLB schedules/probable pitcher sources (MLB.com, ESPN, "
-    "Rotowire) for the specified game date to identify the announced starting pitchers.\n"
-    "   - If a pitcher is unannounced 2 hours before game time, search for the scheduled "
-    "bullpen game opener or rotation turn. Only return TBD if no official announcement "
-    "exists across MLB sources.\n\n"
+    "2. **STARTING PITCHERS:** The confirmed starting pitchers are provided in the user prompt. "
+    "Use them directly — do NOT search for pitchers. If a pitcher is listed as 'TBD', "
+    "that means no official announcement exists yet.\n\n"
     "3. **EXCLUSIONS & HANDOFF:**\n"
     "   - Output ONLY raw fundamental variables (pitcher xFIP/SIERA, venue factors, "
     "bullpen fatigue, offense wRC+).\n"
@@ -135,28 +133,95 @@ SYSTEM_PROMPT = (
 )
 
 USER_PROMPT_TEMPLATE = (
-    "**Task:** Identify the starting pitchers, map the venue, and extract fundamental "
-    "sabermetric inputs for today's MLB matchup.\n\n"
+    "**Task:** Extract fundamental sabermetric inputs for today's MLB matchup.\n\n"
     "**Match Details:**\n"
     "- **Away Team:** {away_team}\n"
     "- **Home Team:** {home_team}\n"
-    "- **Date:** {match_date}\n\n"
+    "- **Date:** {match_date}\n"
+    "- **Away Pitcher:** {away_pitcher}\n"
+    "- **Home Pitcher:** {home_pitcher}\n\n"
     "**Execution Instructions:**\n"
     "1. **Step 1 (Venue):** Resolve `{home_team}` to its official home ballpark name.\n"
-    "2. **Step 2 (Probable Pitchers Search):** Perform a live query for "
-    "\"MLB probable pitchers {match_date} {away_team} vs {home_team}\" to retrieve "
-    "the confirmed or projected starters for both teams.\n"
-    "3. **Step 3 (Sabermetrics Extraction):** Gather recent xFIP, K-BB%, SIERA, and "
-    "handedness splits for both confirmed starters.\n\n"
+    "2. **Step 2 (Sabermetrics Extraction):** Gather recent xFIP, K-BB%, SIERA, and "
+    "handedness splits for both confirmed starters listed above.\n\n"
     "**Required Structural Output:**\n"
     "- **Venue:** [Official Stadium Name]\n"
     "- **Starting Pitchers:** [Away Pitcher Name] ([L/R]) vs. [Home Pitcher Name] ([L/R])\n"
     "- **Starter Metrics:** [xFIP / K-BB% / Platoon Splits for both pitchers]\n"
     "- **Bullpen Rest Index:** [High-leverage usage past 72h]\n"
     "- **Park Factor Modifiers:** [Run/HR park factors for resolved stadium]\n\n"
-    "DO NOT output \"TBD\" or \"Unknown\" without completing the live search step first.\n"
     "Output ONLY the raw JSON object — no markdown, no explanation."
 )
+
+# ── MLB Stats API ───────────────────────────────────────────
+
+def fetch_probable_pitchers(date_str: str) -> dict:
+    """
+    Fetch probable pitchers from MLB Stats API for a given date.
+    Returns a dict keyed by (away_team_lower, home_team_lower) -> (away_pitcher, home_pitcher).
+    """
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date_str}&hydrate=probablePitcher"
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    result = {}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            if resp.status != 200:
+                print(f"[MLB API] HTTP {resp.status} for {date_str}", file=sys.stderr)
+                return result
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[MLB API] Failed to fetch probable pitchers for {date_str}: {e}", file=sys.stderr)
+        return result
+
+    dates = data.get("dates", [])
+    for d in dates:
+        for game in dates[0].get("games", []):
+            away = game.get("teams", {}).get("away", {})
+            home = game.get("teams", {}).get("home", {})
+            away_team = (away.get("team", {}).get("name") or "").lower()
+            home_team = (home.get("team", {}).get("name") or "").lower()
+            away_pitcher = away.get("probablePitcher", {}).get("fullName", "TBD") if away.get("probablePitcher") else "TBD"
+            home_pitcher = home.get("probablePitcher", {}).get("fullName", "TBD") if home.get("probablePitcher") else "TBD"
+
+            if away_team and home_team:
+                result[(away_team, home_team)] = (away_pitcher, home_pitcher)
+                print(f"[MLB API] {away_team} @ {home_team}: {away_pitcher} vs {home_pitcher}", file=sys.stderr)
+
+    print(f"[MLB API] Loaded {len(result)} games for {date_str}", file=sys.stderr)
+    return result
+
+
+def lookup_pitchers(away_team: str, home_team: str, date_str: str) -> tuple[str, str]:
+    """
+    Look up probable pitchers for a matchup. Tries exact match first,
+    then partial (substring) match as fallback.
+    Returns (away_pitcher_name, home_pitcher_name).
+    """
+    pitchers = fetch_probable_pitchers(date_str)
+    away_lower = away_team.lower().strip()
+    home_lower = home_team.lower().strip()
+
+    # Exact match
+    key = (away_lower, home_lower)
+    if key in pitchers:
+        return pitchers[key]
+
+    # Partial match — check if team names are substrings
+    for (a, h), (ap, hp) in pitchers.items():
+        if (away_lower in a or a in away_lower) and (home_lower in h or h in home_lower):
+            print(f"[MLB API] Partial match: '{away_lower}'->'{a}', '{home_lower}'->'{h}'", file=sys.stderr)
+            return (ap, hp)
+
+    # Try swapping (some APIs list home first)
+    for (a, h), (ap, hp) in pitchers.items():
+        if (away_lower in h or h in away_lower) and (home_lower in a or a in home_lower):
+            print(f"[MLB API] Swapped match: '{away_lower}'->'{h}', '{home_lower}'->'{a}'", file=sys.stderr)
+            return (hp, ap)
+
+    print(f"[MLB API] No match for '{away_lower}' @ '{home_lower}' on {date_str}", file=sys.stderr)
+    return ("TBD", "TBD")
+
 
 # ── Gamma API ───────────────────────────────────────────────
 
@@ -316,11 +381,15 @@ def _extract_content_from_choice(choice) -> Optional[str]:
 async def fetch_sabermetric_variables(
     match_title: str, away_team: str, home_team: str,
     match_date: str = "Unknown",
+    away_pitcher: str = "TBD",
+    home_pitcher: str = "TBD",
 ) -> SabermetricOutput:
     client = get_openai_client()
     user_prompt = USER_PROMPT_TEMPLATE.format(
         away_team=away_team, home_team=home_team,
         match_date=match_date,
+        away_pitcher=away_pitcher,
+        home_pitcher=home_pitcher,
     )
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -360,7 +429,6 @@ async def fetch_sabermetric_variables(
     if data is None:
         raise ValueError(f"All API modes failed. Model: {SURPLUS_MODEL}. Last error: {last_error}")
 
-    # Strip None values from nested dicts so Pydantic defaults apply
     return SabermetricOutput(
         away_team=str(data.get("away_team", away_team)),
         home_team=str(data.get("home_team", home_team)),
@@ -520,9 +588,10 @@ async def cmd_mlb(ctx, *, args: str = ""):
             "`!mlb bankroll <1000>` — Set bankroll size\n"
             "`!mlbstatus` — Show current config\n\n"
             "**How it works:**\n"
-            "1. AI extracts sabermetric variables (xFIP, wRC+, bullpen, park factors)\n"
-            "2. Python calculates true win probability from those variables\n"
-            "3. Kelly Criterion determines optimal stakes for +EV outcomes"
+            "1. Python scrapes probable pitchers from MLB Stats API\n"
+            "2. AI extracts sabermetric variables (xFIP, wRC+, bullpen, park factors)\n"
+            "3. Python calculates true win probability from those variables\n"
+            "4. Kelly Criterion determines optimal stakes for +EV outcomes"
         )
         return
 
@@ -599,6 +668,12 @@ async def cmd_mlb(ctx, *, args: str = ""):
             league = series[0].get("title", "MLB") if isinstance(series, list) and series else "MLB"
             match_date = event.get("startDate") or event.get("scheduledStart") or "Unknown"
 
+            # ── Scrape probable pitchers from MLB Stats API ──
+            away_pitcher_name, home_pitcher_name = await asyncio.to_thread(
+                lookup_pitchers, away_team, home_team, str(match_date)
+            )
+            print(f"[MLB CMD] Pitchers: {away_team} -> {away_pitcher_name}, {home_team} -> {home_pitcher_name}", file=sys.stderr)
+
             clob_prices = {}
             for outcome_type in ["away", "home"]:
                 m = market_lookup.get(outcome_type)
@@ -610,6 +685,8 @@ async def cmd_mlb(ctx, *, args: str = ""):
                 sm = await fetch_sabermetric_variables(
                     match_title=title, away_team=away_team, home_team=home_team,
                     match_date=str(match_date),
+                    away_pitcher=away_pitcher_name,
+                    home_pitcher=home_pitcher_name,
                 )
             except Exception as e:
                 await ctx.send(f"❌ **Sabermetric Engine Error**: {type(e).__name__}: {e}")
