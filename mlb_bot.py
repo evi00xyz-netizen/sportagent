@@ -176,7 +176,7 @@ def fetch_probable_pitchers(date_str: str) -> dict:
 
     dates = data.get("dates", [])
     for d in dates:
-        for game in dates[0].get("games", []):
+        for game in d.get("games", []):
             away = game.get("teams", {}).get("away", {})
             home = game.get("teams", {}).get("home", {})
             away_team = (away.get("team", {}).get("name") or "").lower()
